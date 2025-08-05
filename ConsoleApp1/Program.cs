@@ -81,23 +81,23 @@ namespace AdvancedCryptoTradingBot
         #region Components
         private readonly IBinanceRestClient _restClient;
         private readonly IBinanceSocketClient _socketClient;
-        private readonly TelegramBotClient? _telegramBot;
+        private TelegramBotClient? _telegramBot;
         private readonly MLContext _mlContext = new(seed: 1);
         private ITransformer? _model;
         private readonly SqliteConnection _dbConnection;
         private readonly AsyncRetryPolicy _retryPolicy;
-        private readonly ILogger _logger;
+        private ILogger _logger;
         private readonly bool _isSandboxMode;
 
-        private readonly EnhancedRiskEngine _riskEngine;
-        private readonly EnhancedExecutionEngine _executionEngine;
-        private readonly MultiTimeFrameMarketDataProcessor _marketDataProcessor;
-        private readonly PortfolioManager _portfolioManager;
-        private readonly CorrelationAnalyzer _correlationAnalyzer;
-        private readonly OnlineModelTrainer _onlineModelTrainer;
-        private readonly Backtester _backtester;
-        private readonly NewsMonitor _newsMonitor;
-        private readonly StrategyEvaluator _strategyEvaluator;
+        private  EnhancedRiskEngine _riskEngine;
+        private  EnhancedExecutionEngine _executionEngine;
+        private  MultiTimeFrameMarketDataProcessor _marketDataProcessor;
+        private  PortfolioManager _portfolioManager;
+        private  CorrelationAnalyzer _correlationAnalyzer;
+        private  OnlineModelTrainer _onlineModelTrainer;
+        private  Backtester _backtester;
+        private  NewsMonitor _newsMonitor;
+        private  StrategyEvaluator _strategyEvaluator;
         #endregion
 
         #region State
@@ -1564,7 +1564,7 @@ namespace AdvancedCryptoTradingBot
         }
 
         #region Enhanced Components
-        public enum MarketTrend { Bullish, Bearish, Neutral }
+        
 
         /// <summary>
         /// Активная торговая стратегия с метриками производительности
@@ -3548,24 +3548,8 @@ namespace AdvancedCryptoTradingBot
         }
 
         /// <summary>
-        /// Кластер ликвидности (группа близких по цене уровней в стакане)
+        /// Управление портфелем: баланс, позиции, расчет рисков и PnL
         /// </summary>
-        public class LiquidityCluster
-        {
-            public decimal MinPrice { get; set; } // Минимальная цена в кластере
-            public decimal MaxPrice { get; set; } // Максимальная цена в кластере
-            public decimal TotalQuantity { get; set; } // Суммарный объем кластера
-        }
-
-
-
-
-
-
-
-
-
-
         public class PortfolioManager
         {
             private decimal _balance;
@@ -3573,6 +3557,9 @@ namespace AdvancedCryptoTradingBot
             private readonly EnhancedRiskEngine _riskEngine;
             private readonly ILogger _logger;
 
+            /// <summary>
+            /// Текущий баланс портфеля в USDT
+            /// </summary>
             public decimal CurrentBalance => _balance;
 
             public PortfolioManager(
@@ -3585,6 +3572,9 @@ namespace AdvancedCryptoTradingBot
                 _logger = logger;
             }
 
+            /// <summary>
+            /// Обновить баланс из API биржи
+            /// </summary>
             public async Task UpdateBalanceFromExchange(IBinanceRestClient restClient)
             {
                 try
@@ -3605,6 +3595,9 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Обновить баланс из стрима пользовательских данных
+            /// </summary>
             public void UpdateBalance(IEnumerable<BinanceBalance> balances)
             {
                 var usdtBalance = balances.FirstOrDefault(b => b.Asset == "USDT");
@@ -3614,22 +3607,27 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Зарегистрировать сделку в портфеле
+            /// </summary>
             public void RecordTrade(TradeRecord trade)
             {
                 _trades.Add(trade);
 
+                // Обновляем баланс, если сделка закрыта
                 if (trade.ExitPrice.HasValue)
                 {
-                    var pnl = trade.Side == "BUY"
-                        ? (trade.ExitPrice.Value - trade.EntryPrice) * trade.Quantity
-                        : (trade.EntryPrice - trade.ExitPrice.Value) * trade.Quantity;
-
-                    _balance += pnl - trade.Commission;
+                    _balance += trade.Profit ?? 0;
+                    _balance -= trade.Commission;
                 }
             }
 
-            public List<OpenPosition> GetOpenPositions() =>
-                _trades
+            /// <summary>
+            /// Получить список открытых позиций
+            /// </summary>
+            public List<OpenPosition> GetOpenPositions()
+            {
+                return _trades
                     .Where(t => !t.ExitPrice.HasValue)
                     .Select(t => new OpenPosition
                     {
@@ -3640,79 +3638,432 @@ namespace AdvancedCryptoTradingBot
                         StopLoss = t.StopLoss,
                         TakeProfit = t.TakeProfit,
                         Direction = t.Side == "BUY" ? TradeDirection.Long : TradeDirection.Short,
-                        StopLossDistance = Math.Abs(t.EntryPrice - t.StopLoss)
+                        StopLossDistance = Math.Abs(t.EntryPrice - t.StopLoss),
+                        StrategyId = t.StrategyId
                     })
                     .ToList();
+            }
 
+            /// <summary>
+            /// Рассчитать размер позиции с учетом риска
+            /// </summary>
             public decimal CalculatePositionSize(
                 TradingSignal signal,
                 decimal currentPrice,
-                RiskMetrics riskMetrics) =>
-                _riskEngine.CalculatePositionSize(signal, currentPrice, riskMetrics);
+                RiskMetrics riskMetrics)
+            {
+                try
+                {
+                    // Базовый размер на основе риска
+                    var baseSize = _riskEngine.CalculatePositionSize(signal, currentPrice, riskMetrics);
+
+                    // Корректировка на доступный баланс
+                    var maxAffordable = _balance * 0.95m / currentPrice; // 5% оставляем как буфер
+                    return Math.Min(baseSize, maxAffordable);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка расчета размера позиции");
+                    return 0m;
+                }
+            }
+
+            /// <summary>
+            /// Рассчитать прибыль/убыток портфеля (реализованный и нереализованный)
+            /// </summary>
+            public PortfolioPnL CalculatePnL(IDictionary<string, decimal> currentPrices)
+            {
+                var result = new PortfolioPnL();
+
+                try
+                {
+                    // Реализованный PnL
+                    result.RealizedPnL = _trades
+                        .Where(t => t.ExitPrice.HasValue)
+                        .Sum(t => t.Profit ?? 0);
+
+                    // Нереализованный PnL
+                    foreach (var pos in GetOpenPositions())
+                    {
+                        if (currentPrices.TryGetValue(pos.Symbol, out var currentPrice))
+                        {
+                            var pnl = (currentPrice - pos.EntryPrice) * pos.Quantity *
+                                     (pos.Direction == TradeDirection.Long ? 1 : -1);
+                            result.UnrealizedPnL += pnl;
+                        }
+                    }
+
+                    // Общий PnL
+                    result.TotalPnL = result.RealizedPnL + result.UnrealizedPnL;
+
+                    // Комиссии
+                    result.TotalCommission = _trades.Sum(t => t.Commission);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка расчета PnL портфеля");
+                }
+
+                return result;
+            }
+
+            /// <summary>
+            /// Ребалансировка портфеля по стратегиям
+            /// </summary>
+            public async Task RebalancePortfolio(
+                IEnumerable<ActiveStrategy> strategies,
+                IBinanceRestClient restClient)
+            {
+                try
+                {
+                    // Получаем текущие веса стратегий
+                    var strategyWeights = strategies.ToDictionary(
+                        s => s.Id,
+                        s => s.Weight);
+
+                    // Анализируем текущее распределение
+                    var currentAllocation = GetStrategyAllocation();
+
+                    // Определяем целевое распределение
+                    var targetAllocation = strategyWeights
+                        .ToDictionary(
+                            kv => kv.Key,
+                            kv => kv.Value * _balance);
+
+                    // Корректируем позиции
+                    foreach (var symbol in currentAllocation.Keys)
+                    {
+                        var current = currentAllocation[symbol];
+                        var target = targetAllocation.ContainsKey(symbol)
+                            ? targetAllocation[symbol]
+                            : 0;
+
+                        if (current > target)
+                        {
+                            // Нужно уменьшить позицию
+                            var reduceBy = current - target;
+                            await ReducePosition(symbol, reduceBy, restClient);
+                        }
+                        else if (current < target)
+                        {
+                            // Нужно увеличить позицию
+                            var increaseBy = target - current;
+                            await IncreasePosition(symbol, increaseBy, restClient);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка ребалансировки портфеля");
+                }
+            }
+
+            /// <summary>
+            /// Получить текущее распределение капитала по стратегиям
+            /// </summary>
+            public Dictionary<string, decimal> GetStrategyAllocation()
+            {
+                return _trades
+                    .GroupBy(t => t.StrategyId ?? "default")
+                    .ToDictionary(
+                        g => g.Key,
+                        g => g.Sum(t =>
+                            t.ExitPrice.HasValue
+                                ? 0
+                                : t.Quantity * t.EntryPrice));
+            }
+
+            /// <summary>
+            /// Запустить стресс-тест портфеля
+            /// </summary>
+            public StressTestResult RunStressTest(
+                MarketScenario scenario,
+                IDictionary<string, decimal> currentPrices)
+            {
+                var result = new StressTestResult();
+
+                try
+                {
+                    var positions = GetOpenPositions();
+                    decimal portfolioValue = positions.Sum(p =>
+                        currentPrices.GetValueOrDefault(p.Symbol, 0m) * p.Quantity);
+
+                    decimal stressedValue = 0;
+
+                    foreach (var position in positions)
+                    {
+                        var price = currentPrices.GetValueOrDefault(position.Symbol, 0m);
+                        if (price == 0m) continue;
+
+                        decimal newPrice = scenario.Type switch
+                        {
+                            ScenarioType.MarketCrash => price * (1 - scenario.Severity),
+                            ScenarioType.VolatilitySpike => price * (1 + (scenario.Severity *
+                                (position.Direction == TradeDirection.Long ? -1 : 1))),
+                            ScenarioType.LiquidityCrisis => price * 0.9m, // Фиксированный сценарий
+                            _ => price
+                        };
+
+                        stressedValue += newPrice * position.Quantity;
+                    }
+
+                    result.MaxDrawdown = (portfolioValue - stressedValue) / portfolioValue;
+                    result.IsAcceptable = result.MaxDrawdown < _riskEngine.MaxDrawdown;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка стресс-теста портфеля");
+                    result.IsAcceptable = false;
+                }
+
+                return result;
+            }
+
+            /// <summary>
+            /// Рассчитать ключевые метрики риска
+            /// </summary>
+            public RiskMetrics CalculateRiskMetrics(
+                IDictionary<string, decimal> currentPrices,
+                IDictionary<string, decimal> volatilities,
+                IDictionary<string, Dictionary<string, decimal>> correlationMatrix)
+            {
+                var metrics = new RiskMetrics
+                {
+                    PortfolioValue = _balance,
+                    OpenPositions = GetOpenPositions(),
+                    CorrelationMatrix = correlationMatrix
+                };
+
+                try
+                {
+                    // Волатильность портфеля
+                    metrics.Volatility = _riskEngine.CalculatePortfolioRisk(
+                        metrics.OpenPositions,
+                        currentPrices,
+                        volatilities);
+
+                    // CVaR
+                    metrics.CVaR = _riskEngine.CalculateCVaR(
+                        _trades.Where(t => t.ExitPrice.HasValue).ToList(),
+                        0.95m);
+
+                    // Ликвидность
+                    metrics.Liquidity = currentPrices.Sum(
+                        kv => kv.Value * GetPositionSize(kv.Key));
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка расчета метрик риска");
+                }
+
+                return metrics;
+            }
+
+            private decimal GetPositionSize(string symbol)
+            {
+                return _trades
+                    .Where(t => t.Symbol == symbol && !t.ExitPrice.HasValue)
+                    .Sum(t => t.Quantity);
+            }
+
+            private async Task ReducePosition(
+                string symbol,
+                decimal amount,
+                IBinanceRestClient restClient)
+            {
+                try
+                {
+                    var position = GetOpenPositions()
+                        .FirstOrDefault(p => p.Symbol == symbol);
+
+                    if (position != null)
+                    {
+                        var reduceQty = Math.Min(position.Quantity, amount / position.EntryPrice);
+                        if (reduceQty > 0)
+                        {
+                            var orderResult = await restClient.SpotApi.Trading.PlaceOrderAsync(
+                                symbol,
+                                position.Direction == TradeDirection.Long ? OrderSide.Sell : OrderSide.Buy,
+                                SpotOrderType.Market,
+                                quantity: reduceQty);
+
+                            if (!orderResult.Success)
+                            {
+                                _logger?.LogError($"Ошибка уменьшения позиции: {orderResult.Error}");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, $"Ошибка уменьшения позиции {symbol}");
+                }
+            }
+
+            private async Task IncreasePosition(
+                string symbol,
+                decimal amount,
+                IBinanceRestClient restClient)
+            {
+                try
+                {
+                    var currentPrice = await GetCurrentPrice(symbol, restClient);
+                    if (currentPrice == 0) return;
+
+                    var qty = amount / currentPrice;
+                    if (qty > 0)
+                    {
+                        var orderResult = await restClient.SpotApi.Trading.PlaceOrderAsync(
+                            symbol,
+                            OrderSide.Buy,
+                            SpotOrderType.Market,
+                            quantity: qty);
+
+                        if (!orderResult.Success)
+                        {
+                            _logger?.LogError($"Ошибка увеличения позиции: {orderResult.Error}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, $"Ошибка увеличения позиции {symbol}");
+                }
+            }
+
+            private async Task<decimal> GetCurrentPrice(
+                string symbol,
+                IBinanceRestClient restClient)
+            {
+                var ticker = await restClient.SpotApi.ExchangeData.GetTickerAsync(symbol);
+                return ticker.Success ? ticker.Data.LastPrice : 0m;
+            }
         }
 
+        /// <summary>
+        /// Результаты расчета прибыли/убытков портфеля
+        /// </summary>
+        public class PortfolioPnL
+        {
+            public decimal RealizedPnL { get; set; } // Реализованный PnL
+            public decimal UnrealizedPnL { get; set; } // Нереализованный PnL
+            public decimal TotalPnL { get; set; } // Общий PnL
+            public decimal TotalCommission { get; set; } // Суммарные комиссии
+        }
+
+
+        /// <summary>
+        /// Анализатор корреляций между торговыми парами
+        /// </summary>
         public class CorrelationAnalyzer
         {
             private readonly MLContext _mlContext;
             private readonly List<string> _symbols;
             private readonly Dictionary<string, List<double>> _priceHistory;
             private readonly ILogger _logger;
+            private const int MaxHistorySize = 5000; // Максимальное хранимое количество ценовых точек
 
+            /// <summary>
+            /// Конструктор анализатора корреляций
+            /// </summary>
+            /// <param name="symbols">Список символов для анализа</param>
+            /// <param name="logger">Логгер</param>
             public CorrelationAnalyzer(List<string> symbols, ILogger logger = null)
             {
                 _mlContext = new MLContext();
-                _symbols = symbols;
+                _symbols = symbols ?? throw new ArgumentNullException(nameof(symbols));
                 _logger = logger;
                 _priceHistory = symbols.ToDictionary(s => s, _ => new List<double>());
             }
 
+            /// <summary>
+            /// Добавление новой ценовой точки для символа
+            /// </summary>
+            /// <param name="symbol">Торговый символ (например, BTCUSDT)</param>
+            /// <param name="price">Текущая цена</param>
             public void AddPriceData(string symbol, decimal price)
             {
                 try
                 {
                     if (!_priceHistory.ContainsKey(symbol))
-                        throw new ArgumentException($"Символ {symbol} не настроен");
+                    {
+                        throw new ArgumentException($"Символ {symbol} не настроен для анализа");
+                    }
 
+                    // Добавляем новое ценовое значение
                     _priceHistory[symbol].Add((double)price);
 
-                    // Поддержание одинаковой длины для всех рядов
-                    var minLength = _priceHistory.Values.Min(list => list.Count);
-                    foreach (var key in _priceHistory.Keys.ToList())
+                    // Поддерживаем размер истории
+                    if (_priceHistory[symbol].Count > MaxHistorySize)
                     {
-                        _priceHistory[key] = _priceHistory[key]
-                            .Skip(_priceHistory[key].Count - minLength)
-                            .ToList();
+                        _priceHistory[symbol].RemoveAt(0);
                     }
+
+                    // Синхронизируем размеры всех рядов
+                    SyncHistorySizes();
                 }
                 catch (Exception ex)
                 {
-                    _logger?.LogError(ex, $"Ошибка добавления данных цены для {symbol}");
+                    _logger?.LogError(ex, $"Ошибка добавления данных для {symbol}");
+                    throw;
                 }
             }
 
+            /// <summary>
+            /// Синхронизация размеров всех ценовых рядов по минимальному размеру
+            /// </summary>
+            private void SyncHistorySizes()
+            {
+                var minSize = _priceHistory.Values.Min(list => list.Count);
+                foreach (var key in _priceHistory.Keys.ToList())
+                {
+                    if (_priceHistory[key].Count > minSize)
+                    {
+                        _priceHistory[key] = _priceHistory[key]
+                            .Skip(_priceHistory[key].Count - minSize)
+                            .ToList();
+                    }
+                }
+            }
+
+            /// <summary>
+            /// Получение матрицы корреляций между всеми символами
+            /// </summary>
+            /// <returns>Словарь словарей с коэффициентами корреляции</returns>
             public Dictionary<string, Dictionary<string, decimal>> GetCorrelationMatrix()
             {
                 try
                 {
+                    // Проверка достаточности данных
                     if (_priceHistory.Values.First().Count < 2)
-                        return _symbols.ToDictionary(s => s, s => _symbols.ToDictionary(s2 => s2, s2 => 0m));
+                    {
+                        return _symbols.ToDictionary(
+                            s => s,
+                            s => _symbols.ToDictionary(
+                                s2 => s2,
+                                s2 => s == s2 ? 1m : 0m));
+                    }
 
+                    // Подготовка данных для ML.NET
                     var data = new List<CorrelationDataItem>();
                     for (int i = 0; i < _priceHistory.Values.First().Count; i++)
                     {
                         var item = new CorrelationDataItem();
                         foreach (var symbol in _symbols)
                         {
-                            typeof(CorrelationDataItem)
-                                .GetProperty(symbol)
-                                ?.SetValue(item, _priceHistory[symbol][i]);
+                            var prop = typeof(CorrelationDataItem).GetProperty(symbol);
+                            prop?.SetValue(item, _priceHistory[symbol][i]);
                         }
                         data.Add(item);
                     }
 
+                    // Загрузка данных в ML.NET
                     var dataView = _mlContext.Data.LoadFromEnumerable(data);
+
+                    // Вычисление матрицы корреляций
                     var correlationMatrix = _mlContext.Data.ComputeCorrelation(dataView);
 
+                    // Преобразование результатов в удобный формат
                     var matrix = new Dictionary<string, Dictionary<string, decimal>>();
                     for (int i = 0; i < _symbols.Count; i++)
                     {
@@ -3729,10 +4080,19 @@ namespace AdvancedCryptoTradingBot
                 catch (Exception ex)
                 {
                     _logger?.LogError(ex, "Ошибка расчета матрицы корреляции");
-                    return _symbols.ToDictionary(s => s, s => _symbols.ToDictionary(s2 => s2, s2 => 0m));
+                    return _symbols.ToDictionary(
+                        s => s,
+                        s => _symbols.ToDictionary(
+                            s2 => s2,
+                            s2 => s == s2 ? 1m : 0m));
                 }
             }
 
+            /// <summary>
+            /// Генерация торгового сигнала на основе корреляций
+            /// </summary>
+            /// <param name="symbol">Целевой символ</param>
+            /// <returns>Торговый сигнал или null, если недостаточно данных</returns>
             public TradingSignal GenerateCorrelationSignal(string symbol)
             {
                 try
@@ -3742,37 +4102,128 @@ namespace AdvancedCryptoTradingBot
                         .Where(kv => kv.Value > 0.7m && kv.Key != symbol)
                         .ToList();
 
-                    if (!correlatedSymbols.Any()) return null;
+                    if (!correlatedSymbols.Any())
+                        return null;
 
                     // Анализ направления коррелированных символов
                     var bullishCount = correlatedSymbols
-                        .Count(kv => _priceHistory[kv.Key].Last() > _priceHistory[kv.Key][_priceHistory[kv.Key].Count - 2]);
+                        .Count(kv => IsSymbolBullish(kv.Key));
 
                     var bearishCount = correlatedSymbols.Count - bullishCount;
+
+                    // Определяем силу сигнала на основе количества согласованных движений
+                    decimal confidence = (decimal)bullishCount / correlatedSymbols.Count;
+                    confidence = Math.Abs(confidence - 0.5m) * 2; // Нормализация к 0-1
 
                     return new TradingSignal
                     {
                         Symbol = symbol,
-                        Direction = bullishCount > bearishCount ? TradeDirection.Long : TradeDirection.Short,
-                        Confidence = (decimal)bullishCount / correlatedSymbols.Count,
-                        Timestamp = DateTime.UtcNow
+                        Direction = bullishCount > bearishCount ?
+                            TradeDirection.Long : TradeDirection.Short,
+                        Confidence = confidence,
+                        Timestamp = DateTime.UtcNow,
+                        Features = new Dictionary<string, object>
+                    {
+                        { "CorrelatedSymbolsCount", correlatedSymbols.Count },
+                        { "AverageCorrelation", correlatedSymbols.Average(kv => kv.Value) }
+                    }
                     };
                 }
-                catch
+                catch (Exception ex)
                 {
+                    _logger?.LogError(ex, $"Ошибка генерации корреляционного сигнала для {symbol}");
                     return null;
                 }
             }
 
+            /// <summary>
+            /// Проверка бычьего тренда для символа
+            /// </summary>
+            private bool IsSymbolBullish(string symbol)
+            {
+                if (!_priceHistory.ContainsKey(symbol) || _priceHistory[symbol].Count < 50)
+                    return false;
+
+                var prices = _priceHistory[symbol];
+                var lastPrice = prices.Last();
+                var sma20 = prices.TakeLast(20).Average();
+                var sma50 = prices.TakeLast(50).Average();
+
+                return lastPrice > sma20 && sma20 > sma50;
+            }
+
+            /// <summary>
+            /// Получение наиболее коррелированных пар
+            /// </summary>
+            /// <param name="threshold">Порог корреляции (0.7 по умолчанию)</param>
+            /// <returns>Список пар с высокой корреляцией</returns>
+            public List<CorrelatedPair> GetHighlyCorrelatedPairs(decimal threshold = 0.7m)
+            {
+                var matrix = GetCorrelationMatrix();
+                var pairs = new List<CorrelatedPair>();
+
+                foreach (var symbol1 in _symbols)
+                {
+                    foreach (var symbol2 in _symbols)
+                    {
+                        if (symbol1 == symbol2) continue;
+
+                        var correlation = matrix[symbol1][symbol2];
+                        if (correlation >= threshold)
+                        {
+                            pairs.Add(new CorrelatedPair
+                            {
+                                Symbol1 = symbol1,
+                                Symbol2 = symbol2,
+                                Correlation = correlation,
+                                Direction = correlation > 0 ? CorrelationDirection.Positive : CorrelationDirection.Negative
+                            });
+                        }
+                    }
+                }
+
+                return pairs
+                    .DistinctBy(p => new { Min = Math.Min(p.Symbol1, p.Symbol2), Max = Math.Max(p.Symbol1, p.Symbol2) })
+                    .OrderByDescending(p => Math.Abs(p.Correlation))
+                    .ToList();
+            }
+
+            /// <summary>
+            /// Класс для хранения данных корреляции
+            /// </summary>
             private class CorrelationDataItem
             {
                 public double BTCUSDT { get; set; }
                 public double ETHUSDT { get; set; }
                 public double BNBUSDT { get; set; }
+                // Добавьте свойства для других символов по аналогии
             }
         }
 
-        /// <summary></summary>
+        /// <summary>
+        /// Модель коррелированной пары
+        /// </summary>
+        public class CorrelatedPair
+        {
+            public string Symbol1 { get; set; }
+            public string Symbol2 { get; set; }
+            public decimal Correlation { get; set; }
+            public CorrelationDirection Direction { get; set; }
+        }
+
+        /// <summary>
+        /// Направление корреляции
+        /// </summary>
+        public enum CorrelationDirection
+        {
+            Positive,
+            Negative
+        }
+
+
+        /// <summary>
+        /// Класс для онлайн-обучения и прогнозирования с использованием ML-моделей
+        /// </summary>
         public class OnlineModelTrainer
         {
             private readonly MLContext _mlContext;
@@ -3781,102 +4232,148 @@ namespace AdvancedCryptoTradingBot
             private PredictionEngine<MarketDataPoint, PricePrediction> _predictionEngine;
             private readonly ILogger _logger;
             private readonly object _modelLock = new();
-            private DateTime _lastRetrainTime = DateTime.MinValue;
+            private DateTime _lastTrainTime = DateTime.MinValue;
 
+            // Константы для настройки модели
+            private const int RetrainIntervalHours = 4;
+            private const double ValidationSetSize = 0.2;
+            private const int EarlyStoppingRounds = 20;
+            private const int MinimumExamplesForTraining = 1000;
+
+            /// <summary>
+            /// Инициализация тренера моделей
+            /// </summary>
+            /// <param name="mlContext">Контекст ML.NET</param>
+            /// <param name="lookbackWindow">Размер окна исторических данных</param>
+            /// <param name="logger">Логгер</param>
             public OnlineModelTrainer(
                 MLContext mlContext,
                 int lookbackWindow,
                 ILogger logger = null)
             {
-                _mlContext = mlContext;
+                _mlContext = mlContext ?? throw new ArgumentNullException(nameof(mlContext));
                 _lookbackWindow = lookbackWindow;
                 _logger = logger;
+
+                // Инициализация пустой модели при создании
                 InitializeModel();
             }
 
+            /// <summary>
+            /// Инициализация базовой модели
+            /// </summary>
             private void InitializeModel()
             {
                 try
                 {
+                    // Создаем пустой набор данных для инициализации конвейера
                     var emptyData = _mlContext.Data.LoadFromEnumerable(new List<MarketDataPoint>());
 
-                    var pipeline = _mlContext.Transforms.Concatenate("Features",
-                            nameof(MarketDataPoint.RSI),
-                            nameof(MarketDataPoint.MACD),
-                            nameof(MarketDataPoint.ATR),
-                            nameof(MarketDataPoint.Volume),
-                            nameof(MarketDataPoint.OBV),
-                            nameof(MarketDataPoint.OrderBookImbalance))
+                    // Определяем конвейер обработки данных и обучения
+                    var pipeline = _mlContext.Transforms.Concatenate(
+                        outputColumnName: "Features",
+                        inputColumnNames: GetFeatureColumns()) // Используем основные фичи
+                        .Append(_mlContext.Transforms.NormalizeMinMax("Features"))
                         .Append(_mlContext.Regression.Trainers.LightGbm(
-                            new Microsoft.ML.Trainers.LightGbm.LightGbmRegressionTrainer.Options
+                            new LightGbmRegressionTrainer.Options
                             {
-                                NumberOfIterations = 100,
-                                LearningRate = 0.1,
-                                NumberOfLeaves = 20,
+                                NumberOfIterations = 200,
+                                LearningRate = 0.05,
+                                NumberOfLeaves = 31,
+                                MinimumExampleCountPerLeaf = 10,
                                 UseCategoricalSplit = true,
                                 HandleMissingValue = true,
-                                MinimumExampleCountPerLeaf = 10,
-                                FeatureFraction = 0.8,
-                                BaggingFraction = 0.8,
-                                BaggingFreq = 10
+                                EarlyStoppingRound = EarlyStoppingRounds,
+                                LabelColumnName = "FuturePriceChange",
+                                FeatureColumnName = "Features"
                             }));
 
+                    // Обучаем модель на пустых данных (по сути инициализируем структуру)
                     _model = pipeline.Fit(emptyData);
+
+                    // Создаем движок для предсказаний
                     _predictionEngine = _mlContext.Model.CreatePredictionEngine<MarketDataPoint, PricePrediction>(_model);
+
+                    _logger?.LogInformation("ML модель успешно инициализирована");
                 }
                 catch (Exception ex)
                 {
-                    _logger?.LogError(ex, "Ошибка инициализации модели ML");
+                    _logger?.LogError(ex, "Ошибка инициализации ML модели");
                     throw;
                 }
             }
 
+            /// <summary>
+            /// Получение списка используемых фич
+            /// </summary>
+            private string[] GetFeatureColumns()
+            {
+                return new[]
+                {
+                nameof(MarketDataPoint.RSI),
+                nameof(MarketDataPoint.MACD),
+                nameof(MarketDataPoint.ATR),
+                nameof(MarketDataPoint.Volume),
+                nameof(MarketDataPoint.OBV),
+                nameof(MarketDataPoint.VWAP),
+                nameof(MarketDataPoint.OrderBookImbalance),
+                nameof(MarketDataPoint.SMA50),
+                nameof(MarketDataPoint.SMA200)
+            };
+            }
+
+            /// <summary>
+            /// Обновление модели на новых данных
+            /// </summary>
+            /// <param name="newData">Новые рыночные данные</param>
             public async Task UpdateModels(List<MarketDataPoint> newData)
             {
-                if (newData.Count < _lookbackWindow ||
-                    (DateTime.UtcNow - _lastRetrainTime).TotalHours < 1)
+                if (newData == null || newData.Count < MinimumExamplesForTraining)
+                {
+                    _logger?.LogInformation("Недостаточно данных для обновления модели");
                     return;
+                }
+
+                // Проверяем, нужно ли переобучать модель
+                if (DateTime.UtcNow - _lastTrainTime < TimeSpan.FromHours(RetrainIntervalHours))
+                {
+                    return;
+                }
 
                 try
                 {
-                    var dataView = _mlContext.Data.LoadFromEnumerable(newData.TakeLast(_lookbackWindow));
+                    // Подготовка данных в фоновом потоке
+                    var preparedData = await Task.Run(() => PrepareData(newData));
 
-                    // Разделение на обучающую и тестовую выборки
-                    var trainTestSplit = _mlContext.Data.TrainTestSplit(dataView, testFraction: 0.2);
-
-                    var newModel = await Task.Run(() =>
+                    // Проверка качества данных
+                    if (!ValidateData(preparedData.trainingData))
                     {
-                        // Проверка на переобучение
-                        var cvResults = _mlContext.Regression.CrossValidate(
-                            trainTestSplit.TrainSet,
-                            _model.GetPipeline(),
-                            numberOfFolds: 5);
+                        _logger?.LogWarning("Данные для обучения не прошли валидацию");
+                        return;
+                    }
 
-                        var avgRSquared = cvResults.Average(r => r.Metrics.RSquared);
-                        if (avgRSquared < 0.7)
-                        {
-                            _logger?.LogWarning($"Возможно переобучение модели. R²: {avgRSquared:F2}");
-                        }
+                    // Переобучение модели
+                    var newModel = await Task.Run(() => RetrainModel(preparedData.trainingData, preparedData.validationData));
 
-                        // Тестирование на отложенной выборке
-                        var testMetrics = _mlContext.Regression.Evaluate(
-                            _model.Transform(trainTestSplit.TestSet));
+                    // Валидация новой модели
+                    var validationResult = ValidateModel(newModel, preparedData.validationData);
+                    if (!validationResult.IsValid)
+                    {
+                        _logger?.LogWarning($"Новая модель не прошла валидацию: {validationResult.ErrorMessage}");
+                        return;
+                    }
 
-                        if (testMetrics.RSquared < 0.6)
-                        {
-                            _logger?.LogWarning($"Низкое качество на тестовой выборке: {testMetrics.RSquared:F2}");
-                            return _model; // Возвращаем старую модель
-                        }
-
-                        return _model.ContinueTrain(trainTestSplit.TrainSet);
-                    });
-
+                    // Блокировка для безопасного обновления модели
                     lock (_modelLock)
                     {
                         _model = newModel;
                         _predictionEngine = _mlContext.Model.CreatePredictionEngine<MarketDataPoint, PricePrediction>(_model);
-                        _lastRetrainTime = DateTime.UtcNow;
+                        _lastTrainTime = DateTime.UtcNow;
                     }
+
+                    _logger?.LogInformation("Модель успешно обновлена. " +
+                        $"R2: {validationResult.RSquared:F3}, " +
+                        $"MAE: {validationResult.MeanAbsoluteError:F5}");
                 }
                 catch (Exception ex)
                 {
@@ -3884,22 +4381,205 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Подготовка данных для обучения
+            /// </summary>
+            private (IDataView trainingData, IDataView validationData) PrepareData(List<MarketDataPoint> rawData)
+            {
+                // Рассчитываем будущее изменение цены (целевая переменная)
+                var processedData = new List<MarketDataPoint>();
+                for (int i = 0; i < rawData.Count - 1; i++)
+                {
+                    var current = rawData[i];
+                    var next = rawData[i + 1];
+
+                    // Создаем копию с добавленным целевым значением
+                    var dataPoint = new MarketDataPoint
+                    {
+                        Symbol = current.Symbol,
+                        TimeFrame = current.TimeFrame,
+                        OpenTime = current.OpenTime,
+                        Open = current.Open,
+                        High = current.High,
+                        Low = current.Low,
+                        Close = current.Close,
+                        Volume = current.Volume,
+                        RSI = current.RSI,
+                        MACD = current.MACD,
+                        ATR = current.ATR,
+                        OBV = current.OBV,
+                        VWAP = current.VWAP,
+                        OrderBookImbalance = current.OrderBookImbalance,
+                        SMA50 = current.SMA50,
+                        SMA200 = current.SMA200,
+                        FuturePriceChange = (next.Close - current.Close) / current.Close // Целевая переменная
+                    };
+
+                    processedData.Add(dataPoint);
+                }
+
+                // Загружаем данные в IDataView
+                var fullData = _mlContext.Data.LoadFromEnumerable(processedData);
+
+                // Разделяем на обучающую и валидационную выборки
+                var trainTestSplit = _mlContext.Data.TrainTestSplit(fullData, testFraction: ValidationSetSize);
+
+                return (trainTestSplit.TrainSet, trainTestSplit.TestSet);
+            }
+
+            /// <summary>
+            /// Проверка качества данных
+            /// </summary>
+            private bool ValidateData(IDataView data)
+            {
+                try
+                {
+                    // Проверяем, что данные не пустые
+                    if (data.GetRowCount() == 0)
+                    {
+                        _logger?.LogWarning("Пустой набор данных для обучения");
+                        return false;
+                    }
+
+                    // Проверяем наличие всех необходимых колонок
+                    var schema = data.Schema;
+                    foreach (var column in GetFeatureColumns())
+                    {
+                        if (!schema.TryGetColumnIndex(column, out _))
+                        {
+                            _logger?.LogWarning($"Отсутствует колонка {column} в данных");
+                            return false;
+                        }
+                    }
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка валидации данных");
+                    return false;
+                }
+            }
+
+            /// <summary>
+            /// Переобучение модели
+            /// </summary>
+            private ITransformer RetrainModel(IDataView trainingData, IDataView validationData)
+            {
+                try
+                {
+                    // Определяем конвейер обработки данных
+                    var pipeline = _mlContext.Transforms.Concatenate(
+                        outputColumnName: "Features",
+                        inputColumnNames: GetFeatureColumns())
+                        .Append(_mlContext.Transforms.NormalizeMinMax("Features"))
+                        .Append(_mlContext.Regression.Trainers.LightGbm(
+                            new LightGbmRegressionTrainer.Options
+                            {
+                                NumberOfIterations = 200,
+                                LearningRate = 0.05,
+                                NumberOfLeaves = 31,
+                                MinimumExampleCountPerLeaf = 10,
+                                UseCategoricalSplit = true,
+                                HandleMissingValue = true,
+                                EarlyStoppingRound = EarlyStoppingRounds,
+                                ValidationSet = validationData,
+                                LabelColumnName = "FuturePriceChange",
+                                FeatureColumnName = "Features"
+                            }));
+
+                    // Обучаем модель
+                    return pipeline.Fit(trainingData);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка переобучения модели");
+                    throw;
+                }
+            }
+
+            /// <summary>
+            /// Валидация модели
+            /// </summary>
+            private ModelValidationResult ValidateModel(ITransformer model, IDataView validationData)
+            {
+                try
+                {
+                    // Прогнозируем на валидационных данных
+                    var predictions = model.Transform(validationData);
+
+                    // Оцениваем метрики
+                    var metrics = _mlContext.Regression.Evaluate(
+                        data: predictions,
+                        labelColumnName: "FuturePriceChange",
+                        scoreColumnName: "Score");
+
+                    // Проверяем на переобучение
+                    bool isOverfitted = metrics.RSquared > 0.95; // Слишком высокое R2
+
+                    return new ModelValidationResult
+                    {
+                        IsValid = metrics.RSquared > 0.3 && !isOverfitted,
+                        RSquared = metrics.RSquared,
+                        MeanAbsoluteError = metrics.MeanAbsoluteError,
+                        RootMeanSquaredError = metrics.RootMeanSquaredError,
+                        ErrorMessage = isOverfitted ? "Возможно переобучение" : null
+                    };
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Ошибка валидации модели");
+                    return new ModelValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = ex.Message
+                    };
+                }
+            }
+
+            /// <summary>
+            /// Прогнозирование будущего изменения цены
+            /// </summary>
             public TradingSignal Predict(MarketDataPoint data)
             {
                 try
                 {
-                    PricePrediction prediction;
-                    lock (_modelLock)
+                    // Проверяем инициализацию модели
+                    if (_predictionEngine == null)
                     {
-                        prediction = _predictionEngine.Predict(data);
+                        throw new InvalidOperationException("Модель не инициализирована");
                     }
 
+                    // Создаем временную копию данных для предсказания
+                    var predictionData = new MarketDataPoint
+                    {
+                        Symbol = data.Symbol,
+                        TimeFrame = data.TimeFrame,
+                        OpenTime = data.OpenTime,
+                        Open = data.Open,
+                        High = data.High,
+                        Low = data.Low,
+                        Close = data.Close,
+                        Volume = data.Volume,
+                        RSI = data.RSI,
+                        MACD = data.MACD,
+                        ATR = data.ATR,
+                        OBV = data.OBV,
+                        VWAP = data.VWAP,
+                        OrderBookImbalance = data.OrderBookImbalance,
+                        SMA50 = data.SMA50,
+                        SMA200 = data.SMA200
+                    };
+
+                    // Делаем предсказание
+                    var prediction = _predictionEngine.Predict(predictionData);
+
+                    // Формируем торговый сигнал
                     return new TradingSignal
                     {
-                        StrategyId = "ML_Model",
                         Symbol = data.Symbol,
                         Direction = prediction.FuturePriceChange > 0 ? TradeDirection.Long : TradeDirection.Short,
-                        Confidence = Math.Min(1m, Math.Abs((decimal)prediction.FuturePriceChange)),
+                        Confidence = Math.Min(1m, (decimal)Math.Abs(prediction.FuturePriceChange * 10)), // Масштабируем уверенность
                         Timestamp = DateTime.UtcNow,
                         TimeFrame = data.TimeFrame,
                         Features = new Dictionary<string, object>
@@ -3909,6 +4589,7 @@ namespace AdvancedCryptoTradingBot
                         { "ATR", data.ATR },
                         { "Volume", data.Volume },
                         { "OBV", data.OBV },
+                        { "VWAP", data.VWAP },
                         { "OrderBookImbalance", data.OrderBookImbalance },
                         { "PredictedChange", prediction.FuturePriceChange }
                     }
@@ -3919,7 +4600,6 @@ namespace AdvancedCryptoTradingBot
                     _logger?.LogError(ex, "Ошибка предсказания");
                     return new TradingSignal
                     {
-                        StrategyId = "ML_Model",
                         Symbol = data.Symbol,
                         Direction = TradeDirection.Long,
                         Confidence = 0,
@@ -3929,118 +4609,168 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
-            public ModelValidationResult ValidateModel(IDataView testData)
+            /// <summary>
+            /// Анализ важности фич
+            /// </summary>
+            public async Task<Dictionary<string, double>> GetFeatureImportance()
             {
                 try
                 {
-                    var predictions = _model.Transform(testData);
-                    var metrics = _mlContext.Regression.Evaluate(predictions);
-
-                    // Проверка на look-ahead bias
-                    var lookAheadCheck = CheckLookAheadBias(testData);
-
-                    return new ModelValidationResult
+                    return await Task.Run(() =>
                     {
-                        RSquared = metrics.RSquared,
-                        MeanAbsoluteError = metrics.MeanAbsoluteError,
-                        IsLookAheadBiasDetected = lookAheadCheck,
-                        IsValid = metrics.RSquared > 0.6 && !lookAheadCheck
-                    };
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogError(ex, "Ошибка валидации модели");
-                    return new ModelValidationResult { IsValid = false };
-                }
-            }
-
-            private bool CheckLookAheadBias(IDataView data)
-            {
-                // Упрощенная проверка на look-ahead
-                // В реальной реализации нужно сравнивать с out-of-sample тестами
-                var cvResults = _mlContext.Regression.CrossValidate(data, _model.GetPipeline(), 5);
-                var avgDiff = cvResults.Average(r => r.Metrics.RSquared - r.Metrics.LossFunction);
-
-                return avgDiff > 0.3; // Эмпирический порог
-            }
-
-            public FeatureImportance[] GetFeatureImportance()
-            {
-                try
-                {
-                    var permutationMetrics = _mlContext.Regression
-                        .PermutationFeatureImportance(_model, _mlContext.Data.LoadFromEnumerable(new List<MarketDataPoint>()));
-
-                    return permutationMetrics
-                        .Select((metric, index) => new FeatureImportance
+                        // Проверяем, что модель поддерживает анализ важности фич
+                        if (!(_model is ISingleFeaturePredictionTransformer<object>))
                         {
-                            FeatureName = _model.GetInputSchema()[index].Name,
-                            ImportanceScore = metric.RSquared
-                        })
-                        .OrderByDescending(f => f.ImportanceScore)
-                        .ToArray();
+                            throw new NotSupportedException("Модель не поддерживает анализ важности фич");
+                        }
+
+                        // Получаем важность фич из модели
+                        var featureImportance = ((LightGbmRegressionModelParameters)
+                            ((ISingleFeaturePredictionTransformer<object>)_model).Model)
+                            .GetFeatureWeights();
+
+                        // Сопоставляем веса с именами фич
+                        var featureNames = GetFeatureColumns();
+                        var result = new Dictionary<string, double>();
+
+                        for (int i = 0; i < featureNames.Length; i++)
+                        {
+                            result.Add(featureNames[i], featureImportance[i]);
+                        }
+
+                        return result.OrderByDescending(x => x.Value)
+                            .ToDictionary(x => x.Key, x => x.Value);
+                    });
                 }
                 catch (Exception ex)
                 {
-                    _logger?.LogError(ex, "Ошибка расчета важности признаков");
-                    return Array.Empty<FeatureImportance>();
+                    _logger?.LogError(ex, "Ошибка анализа важности фич");
+                    return new Dictionary<string, double>();
                 }
             }
 
-            public async Task<RetrainResult> RetrainModel(List<MarketDataPoint> newData)
+            /// <summary>
+            /// Проверка дрейфа данных (data drift)
+            /// </summary>
+            public async Task<DataDriftReport> CheckDataDrift(List<MarketDataPoint> recentData)
             {
-                try
+                return await Task.Run(() =>
                 {
-                    var fullData = _mlContext.Data.LoadFromEnumerable(newData.TakeLast(_lookbackWindow * 2));
-                    var split = _mlContext.Data.TrainTestSplit(fullData, 0.3);
-
-                    var newModel = await Task.Run(() =>
-                        _mlContext.Regression.Trainers.LightGbm()
-                            .Fit(split.TrainSet));
-
-                    var metrics = _mlContext.Regression.Evaluate(newModel.Transform(split.TestSet));
-
-                    return new RetrainResult
+                    try
                     {
-                        Model = newModel,
-                        TestData = split.TestSet,
-                        Metrics = metrics,
-                        IsSuccessful = metrics.RSquared > 0.65
-                    };
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogError(ex, "Ошибка переобучения модели");
-                    return new RetrainResult { IsSuccessful = false };
-                }
+                        if (recentData.Count < 100)
+                        {
+                            throw new ArgumentException("Недостаточно данных для анализа дрейфа");
+                        }
+
+                        var report = new DataDriftReport();
+                        var featureColumns = GetFeatureColumns();
+
+                        // Анализируем распределение каждой фичи
+                        foreach (var feature in featureColumns)
+                        {
+                            var values = recentData
+                                .Select(d => (double)d.GetType().GetProperty(feature).GetValue(d))
+                                .Where(v => !double.IsNaN(v) && !double.IsInfinity(v))
+                                .ToList();
+
+                            if (!values.Any())
+                            {
+                                continue;
+                            }
+
+                            var stats = new FeatureStats
+                            {
+                                FeatureName = feature,
+                                Mean = values.Average(),
+                                StdDev = CalculateStdDev(values),
+                                Min = values.Min(),
+                                Max = values.Max(),
+                                Percentile25 = CalculatePercentile(values, 0.25),
+                                Percentile75 = CalculatePercentile(values, 0.75)
+                            };
+
+                            report.FeatureStats.Add(stats);
+                        }
+
+                        // TODO: Добавить сравнение с эталонным распределением
+                        // и расчет показателей дрейфа
+
+                        return report;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogError(ex, "Ошибка анализа дрейфа данных");
+                        return new DataDriftReport { Error = ex.Message };
+                    }
+                });
+            }
+
+            private double CalculateStdDev(List<double> values)
+            {
+                var mean = values.Average();
+                var sum = values.Sum(v => Math.Pow(v - mean, 2));
+                return Math.Sqrt(sum / (values.Count - 1));
+            }
+
+            private double CalculatePercentile(List<double> values, double percentile)
+            {
+                var sorted = values.OrderBy(v => v).ToList();
+                int index = (int)Math.Ceiling(percentile * sorted.Count) - 1;
+                return sorted[Math.Max(0, index)];
             }
         }
 
-       
+        /// <summary>
+        /// Результат предсказания модели
+        /// </summary>
+        public class PricePrediction
+        {
+            [ColumnName("Score")]
+            public float FuturePriceChange { get; set; }
+        }
 
+        /// <summary>
+        /// Результат валидации модели
+        /// </summary>
         public class ModelValidationResult
         {
+            public bool IsValid { get; set; }
             public double RSquared { get; set; }
             public double MeanAbsoluteError { get; set; }
-            public bool IsLookAheadBiasDetected { get; set; }
-            public bool IsValid { get; set; }
+            public double RootMeanSquaredError { get; set; }
+            public string ErrorMessage { get; set; }
         }
 
-        public class FeatureImportance
+        /// <summary>
+        /// Отчет о дрейфе данных
+        /// </summary>
+        public class DataDriftReport
+        {
+            public List<FeatureStats> FeatureStats { get; set; } = new();
+            public string Error { get; set; }
+            public bool HasDrift { get; set; }
+            public double DriftScore { get; set; }
+        }
+
+        /// <summary>
+        /// Статистика по фиче
+        /// </summary>
+        public class FeatureStats
         {
             public string FeatureName { get; set; }
-            public double ImportanceScore { get; set; }
+            public double Mean { get; set; }
+            public double StdDev { get; set; }
+            public double Min { get; set; }
+            public double Max { get; set; }
+            public double Percentile25 { get; set; }
+            public double Percentile75 { get; set; }
+            public double DriftScore { get; set; }
         }
 
-        public class RetrainResult
-        {
-            public ITransformer Model { get; set; }
-            public IDataView TestData { get; set; }
-            public RegressionMetrics Metrics { get; set; }
-            public bool IsSuccessful { get; set; }
-        }
-
-        /// <summary></summary>
+        /// <summary>
+        /// Расширенный бэктестер для тестирования торговых стратегий
+        /// </summary>
         public class Backtester
         {
             private readonly IBinanceRestClient _restClient;
@@ -4060,11 +4790,255 @@ namespace AdvancedCryptoTradingBot
                 _timeFrames = timeFrames;
             }
 
+            /// <summary>
+            /// Запуск комплексного бэктеста стратегии
+            /// </summary>
+            /// <param name="symbol">Торговый символ (например, BTCUSDT)</param>
+            /// <param name="interval">Таймфрейм для анализа</param>
+            /// <param name="lookbackDays">Количество дней исторических данных</param>
+            /// <param name="filter">Фильтр рыночных условий (опционально)</param>
             public async Task<BacktestResult> RunBacktest(
                 string symbol,
                 KlineInterval interval,
                 int lookbackDays,
                 string filter = null)
+            {
+                var result = new BacktestResult();
+
+                try
+                {
+                    // 1. Получение исторических данных
+                    var historicalData = await GetHistoricalData(symbol, interval, lookbackDays);
+
+                    // 2. Применение фильтра рыночных условий (если указан)
+                    if (!string.IsNullOrEmpty(filter))
+                    {
+                        historicalData = ApplyMarketConditionFilter(historicalData, filter);
+                    }
+
+                    // 3. Проверка достаточности данных
+                    if (historicalData.Count < 100)
+                    {
+                        _logger.LogWarning($"Недостаточно данных для бэктеста: {historicalData.Count} баров");
+                        result.Success = false;
+                        return result;
+                    }
+
+                    // 4. Инициализация параметров бэктеста
+                    decimal balance = 10000m; // Начальный баланс в USDT
+                    decimal positionSize = 0m;
+                    decimal entryPrice = 0m;
+                    var trades = new List<TradeRecord>();
+                    var dailyBalances = new List<decimal>();
+                    var maxBalance = balance;
+                    var maxDrawdown = 0m;
+
+                    // 5. Основной цикл бэктеста
+                    for (int i = 50; i < historicalData.Count - 1; i++)
+                    {
+                        var currentBar = historicalData[i];
+                        var nextBar = historicalData[i + 1];
+
+                        // Генерация торгового сигнала
+                        var signal = _marketDataProcessor.GenerateTaSignal(currentBar);
+
+                        // Логика входа в позицию
+                        if (positionSize == 0 && signal.Confidence > 0.7m)
+                        {
+                            // Расчет размера позиции с учетом риска
+                            positionSize = balance * 0.1m / currentBar.Close; // Риск 10% на сделку
+                            entryPrice = currentBar.Close;
+
+                            // Фиксируем сделку
+                            trades.Add(new TradeRecord
+                            {
+                                Symbol = symbol,
+                                Side = signal.Direction == TradeDirection.Long ? "BUY" : "SELL",
+                                Quantity = positionSize,
+                                EntryPrice = entryPrice,
+                                EntryTime = currentBar.OpenTime,
+                                TimeFrame = interval.ToString()
+                            });
+                        }
+                        // Логика выхода из позиции
+                        else if (positionSize > 0)
+                        {
+                            bool shouldExit = false;
+                            decimal exitPrice = nextBar.Close;
+                            string exitReason = "Regular exit";
+
+                            // Проверка стоп-лосса / тейк-профита
+                            if ((signal.Direction == TradeDirection.Long && nextBar.Low <= entryPrice * 0.95m) ||
+                                (signal.Direction == TradeDirection.Short && nextBar.High >= entryPrice * 1.05m))
+                            {
+                                shouldExit = true;
+                                exitReason = "Stop loss";
+                            }
+                            else if ((signal.Direction == TradeDirection.Long && nextBar.High >= entryPrice * 1.1m) ||
+                                     (signal.Direction == TradeDirection.Short && nextBar.Low <= entryPrice * 0.9m))
+                            {
+                                shouldExit = true;
+                                exitReason = "Take profit";
+                            }
+
+                            // Выход по противоположному сигналу
+                            if (!shouldExit && signal.Confidence > 0.7m &&
+                                ((signal.Direction == TradeDirection.Long && trades.Last().Side == "SELL") ||
+                                 (signal.Direction == TradeDirection.Short && trades.Last().Side == "BUY")))
+                            {
+                                shouldExit = true;
+                                exitReason = "Reverse signal";
+                            }
+
+                            if (shouldExit)
+                            {
+                                // Расчет PnL
+                                decimal pnl = positionSize * (exitPrice - entryPrice) *
+                                            (trades.Last().Side == "BUY" ? 1 : -1);
+                                decimal commission = positionSize * exitPrice * 0.001m; // 0.1% комиссия
+                                decimal netPnl = pnl - commission;
+
+                                // Обновление баланса
+                                balance += netPnl;
+                                maxBalance = Math.Max(maxBalance, balance);
+                                maxDrawdown = Math.Max(maxDrawdown, (maxBalance - balance) / maxBalance);
+
+                                // Фиксация сделки
+                                trades.Last().ExitPrice = exitPrice;
+                                trades.Last().ExitTime = nextBar.OpenTime;
+                                trades.Last().Profit = netPnl;
+                                trades.Last().Commission = commission;
+                                trades.Last().ExitReason = exitReason;
+
+                                // Сброс позиции
+                                positionSize = 0m;
+                                entryPrice = 0m;
+                            }
+                        }
+
+                        // Фиксация дневного баланса
+                        if (i > 0 && historicalData[i].OpenTime.Day != historicalData[i - 1].OpenTime.Day)
+                        {
+                            dailyBalances.Add(balance);
+                        }
+                    }
+
+                    // 6. Расчет итоговых метрик
+                    result.Success = true;
+                    result.Trades = trades;
+                    result.TotalReturn = (balance - 10000m) / 10000m;
+                    result.MaxDrawdown = maxDrawdown;
+                    result.WinRate = trades.Count > 0 ?
+                        trades.Count(t => t.Profit > 0) / (decimal)trades.Count : 0m;
+                    result.SharpeRatio = CalculateSharpeRatio(dailyBalances);
+                    result.SortinoRatio = CalculateSortinoRatio(dailyBalances);
+                    result.ProfitFactor = CalculateProfitFactor(trades);
+                    result.AvgTradeDuration = CalculateAverageTradeDuration(trades);
+                    result.TimeFrame = interval.ToString();
+
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка при выполнении бэктеста");
+                    result.Success = false;
+                    return result;
+                }
+            }
+
+            /// <summary>
+            /// Тестирование проскальзывания для разных типов ордеров
+            /// </summary>
+            public SlippageAnalysis TestSlippage(string symbol, decimal orderSize)
+            {
+                var analysis = new SlippageAnalysis();
+
+                try
+                {
+                    // Получаем текущий стакан цен
+                    var orderBook = _marketDataProcessor.GetLatestOrderBook(symbol);
+                    if (orderBook == null) return analysis;
+
+                    // Тестируем рыночный ордер
+                    decimal marketOrderSlippage = SimulateMarketOrder(orderBook, orderSize);
+                    analysis.MarketOrderSlippage = marketOrderSlippage;
+
+                    // Тестируем лимитный ордер
+                    decimal limitOrderSlippage = SimulateLimitOrder(orderBook, orderSize);
+                    analysis.LimitOrderSlippage = limitOrderSlippage;
+
+                    // Тестируем TWAP ордер
+                    decimal twapSlippage = SimulateTwapOrder(orderBook, orderSize);
+                    analysis.TwapSlippage = twapSlippage;
+
+                    return analysis;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка тестирования проскальзывания");
+                    return analysis;
+                }
+            }
+
+            /// <summary>
+            /// Запуск Monte-Carlo симуляции
+            /// </summary>
+            public MonteCarloResult RunMonteCarloSimulation(List<TradeRecord> trades, int iterations = 1000)
+            {
+                var result = new MonteCarloResult();
+
+                try
+                {
+                    if (trades == null || !trades.Any()) return result;
+
+                    var random = new Random();
+                    var outcomes = new List<decimal>();
+                    var tradeCount = trades.Count;
+
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        decimal balance = 10000m;
+
+                        // Симуляция случайной последовательности сделок
+                        for (int j = 0; j < tradeCount; j++)
+                        {
+                            int randomIndex = random.Next(0, tradeCount);
+                            var trade = trades[randomIndex];
+
+                            if (trade.Profit.HasValue)
+                            {
+                                balance += trade.Profit.Value;
+                            }
+                        }
+
+                        outcomes.Add(balance);
+                    }
+
+                    // Расчет статистик
+                    result.BestCase = outcomes.Max();
+                    result.WorstCase = outcomes.Min();
+                    result.Median = outcomes.OrderBy(x => x).ElementAt(iterations / 2);
+                    result.ProbabilityOfProfit = outcomes.Count(x => x > 10000m) / (decimal)iterations;
+                    result.Success = true;
+
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка Monte-Carlo симуляции");
+                    return result;
+                }
+            }
+
+            #region Вспомогательные методы
+
+            /// <summary>
+            /// Получение исторических данных с биржи
+            /// </summary>
+            private async Task<List<MarketDataPoint>> GetHistoricalData(
+                string symbol,
+                KlineInterval interval,
+                int lookbackDays)
             {
                 var endTime = DateTime.UtcNow;
                 var startTime = endTime.AddDays(-lookbackDays);
@@ -4074,20 +5048,14 @@ namespace AdvancedCryptoTradingBot
 
                 if (!klinesResult.Success)
                 {
-                    _logger.LogError($"Бэктест не удался: {klinesResult.Error}");
-                    return new BacktestResult { Success = false };
+                    _logger.LogError($"Ошибка получения данных: {klinesResult.Error}");
+                    return new List<MarketDataPoint>();
                 }
 
-                var marketData = ProcessMarketData(klinesResult.Data, filter);
-
-                return ExecuteBacktest(marketData, symbol, interval);
-            }
-
-            private List<MarketDataPoint> ProcessMarketData(IEnumerable<BinanceKline> klines, string filter)
-            {
-                var data = klines.Select(k => new MarketDataPoint
+                return klinesResult.Data.Select(k => new MarketDataPoint
                 {
-                    Symbol = k.Symbol,
+                    Symbol = symbol,
+                    TimeFrame = interval,
                     OpenTime = k.OpenTime,
                     Open = k.OpenPrice,
                     High = k.HighPrice,
@@ -4096,307 +5064,269 @@ namespace AdvancedCryptoTradingBot
                     Volume = k.Volume,
                     IsClosed = true
                 }).ToList();
-
-                // Применение фильтров
-                if (filter == "HighVolatility")
-                {
-                    data = data
-                        .Where(d => (d.High - d.Low) / d.Close > 0.02m)
-                        .ToList();
-                }
-                else if (filter == "LowLiquidity")
-                {
-                    foreach (var d in data)
-                    {
-                        d.Close *= 1.001m; // Имитация проскальзывания
-                    }
-                }
-
-                // Расчет индикаторов
-                foreach (var point in data)
-                {
-                    _marketDataProcessor.CalculateIndicators(point);
-                }
-
-                return data;
             }
 
-            private BacktestResult ExecuteBacktest(List<MarketDataPoint> data, string symbol, KlineInterval interval)
+            /// <summary>
+            /// Применение фильтра рыночных условий
+            /// </summary>
+            private List<MarketDataPoint> ApplyMarketConditionFilter(
+                List<MarketDataPoint> data,
+                string filter)
             {
-                decimal balance = 10000m;
-                int wins = 0, losses = 0;
-                decimal maxBalance = balance;
-                decimal maxDrawdown = 0m;
-                var returns = new List<decimal>();
-                var trades = new List<TradeRecord>();
-                var equityCurve = new List<decimal>();
-
-                for (int i = 50; i < data.Count - 1; i++)
+                switch (filter.ToLower())
                 {
-                    var current = data[i];
-                    var signal = _marketDataProcessor.GenerateTaSignal(current);
+                    case "highvolatility":
+                        // Фильтр высокой волатильности (ATR > среднего)
+                        decimal avgAtr = data.Average(d => d.ATR);
+                        return data.Where(d => d.ATR > avgAtr * 1.5m).ToList();
 
-                    if (signal.Confidence > 0.7m)
-                    {
-                        decimal entry = current.Close;
-                        decimal exit = data[i + 1].Close;
+                    case "lowliquidity":
+                        // Фильтр низкой ликвидности (объем < среднего)
+                        decimal avgVolume = data.Average(d => d.Volume);
+                        return data.Where(d => d.Volume < avgVolume * 0.5m).ToList();
 
-                        // Эмуляция исполнения
-                        decimal commission = entry * 0.001m * 2;
-                        decimal slippage = entry * 0.0005m * (signal.Direction == TradeDirection.Long ? 1 : -1);
+                    case "uptrend":
+                        // Только восходящие тренды (цена выше SMA50)
+                        return data.Where(d => d.Close > d.SMA50).ToList();
 
-                        decimal pnl = (exit - entry) * (signal.Direction == TradeDirection.Long ? 1 : -1);
-                        decimal netPnl = pnl - commission - slippage;
+                    case "downtrend":
+                        // Только нисходящие тренды (цена ниже SMA50)
+                        return data.Where(d => d.Close < d.SMA50).ToList();
 
-                        // Обновление баланса
-                        balance += netPnl;
-                        returns.Add(netPnl / 10000m);
-                        equityCurve.Add(balance);
-
-                        // Обновление метрик
-                        maxBalance = Math.Max(maxBalance, balance);
-                        maxDrawdown = Math.Max(maxDrawdown, (maxBalance - balance) / maxBalance);
-
-                        if (netPnl > 0) wins++; else losses++;
-
-                        // Сохранение сделки
-                        trades.Add(new TradeRecord
-                        {
-                            Symbol = symbol,
-                            Side = signal.Direction == TradeDirection.Long ? "BUY" : "SELL",
-                            Quantity = 10000m / entry,
-                            EntryPrice = entry,
-                            ExitPrice = exit,
-                            EntryTime = current.OpenTime,
-                            ExitTime = data[i + 1].OpenTime,
-                            Profit = netPnl,
-                            Commission = commission,
-                            Slippage = slippage,
-                            TimeFrame = interval.ToString(),
-                            StrategyId = "Backtest_TA"
-                        });
-                    }
-                }
-
-                return new BacktestResult
-                {
-                    Success = true,
-                    SharpeRatio = CalculateSharpeRatio(returns),
-                    SortinoRatio = CalculateSortinoRatio(returns),
-                    ProfitFactor = CalculateProfitFactor(trades),
-                    TotalReturn = (balance - 10000m) / 10000m,
-                    MaxDrawdown = maxDrawdown,
-                    WinRate = trades.Count > 0 ? (decimal)wins / trades.Count : 0m,
-                    TimeFrame = interval.ToString(),
-                    Trades = trades,
-                    EquityCurve = equityCurve,
-                    StabilityIndex = CalculateStabilityIndex(equityCurve)
-                };
-            }
-
-            public SlippageAnalysis TestSlippage(string symbol, decimal orderSize)
-            {
-                try
-                {
-                    var orderBook = _restClient.SpotApi.ExchangeData.GetOrderBookAsync(symbol, 1000).Result;
-                    if (!orderBook.Success)
-                        return new SlippageAnalysis { Success = false };
-
-                    decimal remaining = orderSize;
-                    decimal totalCost = 0;
-                    decimal totalQuantity = 0;
-
-                    foreach (var ask in orderBook.Data.Asks.OrderBy(a => a.Price))
-                    {
-                        decimal quantity = Math.Min(remaining, ask.Quantity);
-                        totalCost += quantity * ask.Price;
-                        totalQuantity += quantity;
-                        remaining -= quantity;
-
-                        if (remaining <= 0) break;
-                    }
-
-                    if (remaining > 0)
-                    {
-                        return new SlippageAnalysis
-                        {
-                            Success = false,
-                            Error = "Недостаточная ликвидность"
-                        };
-                    }
-
-                    decimal avgPrice = totalCost / totalQuantity;
-                    decimal slippage = (avgPrice - orderBook.Data.Asks.First().Price) / orderBook.Data.Asks.First().Price;
-
-                    return new SlippageAnalysis
-                    {
-                        Success = true,
-                        Symbol = symbol,
-                        OrderSize = orderSize,
-                        AveragePrice = avgPrice,
-                        SlippagePercent = slippage * 100,
-                        LiquidityRequired = totalCost
-                    };
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Ошибка тестирования проскальзывания");
-                    return new SlippageAnalysis { Success = false, Error = ex.Message };
+                    default:
+                        return data;
                 }
             }
 
-            public MonteCarloResult RunMonteCarloSimulation(List<TradeRecord> trades, int iterations = 1000)
+            /// <summary>
+            /// Расчет коэффициента Шарпа
+            /// </summary>
+            private decimal CalculateSharpeRatio(List<decimal> dailyBalances)
             {
-                var result = new MonteCarloResult();
-                var random = new Random();
-                var equityCurves = new List<List<decimal>>();
+                if (dailyBalances.Count < 2) return 0m;
 
                 try
                 {
-                    for (int i = 0; i < iterations; i++)
+                    var returns = new List<decimal>();
+                    for (int i = 1; i < dailyBalances.Count; i++)
                     {
-                        decimal balance = 10000m;
-                        var shuffledTrades = trades.OrderBy(x => random.Next()).ToList();
-                        var curve = new List<decimal>();
-
-                        foreach (var trade in shuffledTrades)
-                        {
-                            balance += trade.Profit ?? 0;
-                            curve.Add(balance);
-                        }
-
-                        equityCurves.Add(curve);
+                        returns.Add((dailyBalances[i] - dailyBalances[i - 1]) / dailyBalances[i - 1]);
                     }
 
-                    // Анализ результатов
-                    result.Success = true;
-                    result.MinFinalBalance = equityCurves.Min(c => c.Last());
-                    result.MaxFinalBalance = equityCurves.Max(c => c.Last());
-                    result.AvgFinalBalance = equityCurves.Average(c => c.Last());
-                    result.ProbabilityOfProfit = equityCurves.Count(c => c.Last() > 10000m) / (decimal)iterations;
-                    result.MaxDrawdownDistribution = equityCurves
-                        .Select(CalculateMaxDrawdown)
-                        .GroupBy(d => Math.Round(d, 2))
-                        .ToDictionary(g => g.Key, g => g.Count());
+                    var avgReturn = returns.Average();
+                    var stdDev = (decimal)Math.Sqrt(returns.Select(r => Math.Pow((double)(r - avgReturn), 2)).Average());
+
+                    return stdDev != 0 ? avgReturn / stdDev * (decimal)Math.Sqrt(365) : 0m;
                 }
-                catch (Exception ex)
+                catch
                 {
-                    _logger.LogError(ex, "Ошибка Monte-Carlo симуляции");
-                    result.Success = false;
-                    result.Error = ex.Message;
+                    return 0m;
                 }
-
-                return result;
             }
 
-            private decimal CalculateSharpeRatio(List<decimal> returns)
+            /// <summary>
+            /// Расчет коэффициента Сортино
+            /// </summary>
+            private decimal CalculateSortinoRatio(List<decimal> dailyBalances)
             {
-                if (returns.Count == 0) return 0m;
+                if (dailyBalances.Count < 2) return 0m;
 
-                var avgReturn = returns.Average();
-                var stdDev = (decimal)Math.Sqrt(returns.Select(r => Math.Pow((double)(r - avgReturn), 2)).Average());
+                try
+                {
+                    var returns = new List<decimal>();
+                    for (int i = 1; i < dailyBalances.Count; i++)
+                    {
+                        returns.Add((dailyBalances[i] - dailyBalances[i - 1]) / dailyBalances[i - 1]);
+                    }
 
-                return stdDev != 0 ? avgReturn / stdDev * (decimal)Math.Sqrt(365) : 0m;
+                    var avgReturn = returns.Average();
+                    var downsideStdDev = (decimal)Math.Sqrt(
+                        returns.Where(r => r < 0)
+                               .Select(r => Math.Pow((double)r, 2))
+                               .Average());
+
+                    return downsideStdDev != 0 ? avgReturn / downsideStdDev * (decimal)Math.Sqrt(365) : 0m;
+                }
+                catch
+                {
+                    return 0m;
+                }
             }
 
-            private decimal CalculateSortinoRatio(List<decimal> returns)
-            {
-                if (returns.Count == 0) return 0m;
-
-                var avgReturn = returns.Average();
-                var downsideStdDev = (decimal)Math.Sqrt(
-                    returns.Where(r => r < 0)
-                    .Select(r => Math.Pow((double)r, 2))
-                    .Average());
-
-                return downsideStdDev != 0 ? avgReturn / downsideStdDev * (decimal)Math.Sqrt(365) : 0m;
-            }
-
+            /// <summary>
+            /// Расчет Profit Factor (отношение прибыли к убыткам)
+            /// </summary>
             private decimal CalculateProfitFactor(List<TradeRecord> trades)
             {
-                var grossProfit = trades.Where(t => t.Profit > 0).Sum(t => t.Profit) ?? 0m;
-                var grossLoss = Math.Abs(trades.Where(t => t.Profit < 0).Sum(t => t.Profit) ?? 0m);
+                if (!trades.Any() || !trades.All(t => t.Profit.HasValue)) return 0m;
 
-                return grossLoss != 0 ? grossProfit / grossLoss : 0m;
+                decimal grossProfit = trades.Where(t => t.Profit > 0).Sum(t => t.Profit.Value);
+                decimal grossLoss = Math.Abs(trades.Where(t => t.Profit < 0).Sum(t => t.Profit.Value));
+
+                return grossLoss != 0 ? grossProfit / grossLoss : decimal.MaxValue;
             }
 
-            private decimal CalculateStabilityIndex(List<decimal> equityCurve)
+            /// <summary>
+            /// Расчет средней продолжительности сделки (в минутах)
+            /// </summary>
+            private decimal CalculateAverageTradeDuration(List<TradeRecord> trades)
             {
-                if (equityCurve.Count < 2) return 1m;
+                if (!trades.Any() || !trades.All(t => t.ExitTime.HasValue)) return 0m;
 
-                decimal sum = 0;
-                for (int i = 1; i < equityCurve.Count; i++)
+                var durations = trades.Select(t =>
+                    (t.ExitTime.Value - t.EntryTime).TotalMinutes);
+
+                return (decimal)durations.Average();
+            }
+
+            /// <summary>
+            /// Симуляция рыночного ордера
+            /// </summary>
+            private decimal SimulateMarketOrder(OrderBook book, decimal orderSize)
+            {
+                decimal executedQuantity = 0m;
+                decimal totalCost = 0m;
+                decimal remaining = orderSize;
+
+                foreach (var ask in book.Asks.OrderBy(a => a.Price))
                 {
-                    sum += Math.Abs(equityCurve[i] - equityCurve[i - 1]) / equityCurve[i - 1];
+                    if (remaining <= 0) break;
+
+                    decimal fill = Math.Min(remaining, ask.Quantity);
+                    totalCost += fill * ask.Price;
+                    executedQuantity += fill;
+                    remaining -= fill;
                 }
 
-                return 1 - (sum / (equityCurve.Count - 1));
+                if (executedQuantity == 0) return 0m;
+
+                decimal avgPrice = totalCost / executedQuantity;
+                decimal midPrice = (book.Asks[0].Price + book.Bids[0].Price) / 2;
+
+                return (avgPrice - midPrice) / midPrice * 100m; // Проскальзывание в %
             }
 
-            private decimal CalculateMaxDrawdown(List<decimal> equityCurve)
+            /// <summary>
+            /// Симуляция лимитного ордера
+            /// </summary>
+            private decimal SimulateLimitOrder(OrderBook book, decimal orderSize)
             {
-                decimal peak = equityCurve[0];
-                decimal maxDrawdown = 0;
+                decimal midPrice = (book.Asks[0].Price + book.Bids[0].Price) / 2;
+                decimal limitPrice = midPrice * 0.995m; // На 0.5% ниже середины
 
-                foreach (var value in equityCurve)
+                // Предполагаем, что ордер заполняется частично
+                decimal fillRatio = 0.7m; // Эмпирически определенный коэффициент
+                decimal executedQuantity = orderSize * fillRatio;
+
+                // Условное проскальзывание для лимитного ордера
+                return -0.05m; // Часто отрицательное (выгода)
+            }
+
+            /// <summary>
+            /// Симуляция TWAP ордера
+            /// </summary>
+            private decimal SimulateTwapOrder(OrderBook book, decimal orderSize)
+            {
+                // Эмуляция разбивки на 5 частей с интервалом 5 минут
+                decimal chunk = orderSize / 5m;
+                decimal totalSlippage = 0m;
+
+                for (int i = 0; i < 5; i++)
                 {
-                    if (value > peak) peak = value;
-                    decimal drawdown = (peak - value) / peak;
-                    if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+                    // Предполагаем небольшое изменение цены за время исполнения
+                    decimal priceChange = (decimal)((i - 2) * 0.0005); // -0.1% до +0.1%
+                    decimal currentMid = (book.Asks[0].Price + book.Bids[0].Price) / 2;
+                    decimal executionPrice = currentMid * (1 + priceChange);
+
+                    decimal chunkSlippage = (executionPrice - currentMid) / currentMid * 100m;
+                    totalSlippage += chunkSlippage;
                 }
 
-                return maxDrawdown;
+                return totalSlippage / 5m; // Среднее проскальзывание
             }
+
+            #endregion
         }
 
-        public class SlippageAnalysis
+        /// <summary>
+        /// Результат бэктеста
+        /// </summary>
+        public class BacktestResult
         {
             public bool Success { get; set; }
-            public string Symbol { get; set; }
-            public decimal OrderSize { get; set; }
-            public decimal AveragePrice { get; set; }
-            public decimal SlippagePercent { get; set; }
-            public decimal LiquidityRequired { get; set; }
-            public string Error { get; set; }
+            public decimal TotalReturn { get; set; } // Общая доходность (например, 0.1 для 10%)
+            public decimal MaxDrawdown { get; set; } // Максимальная просадка
+            public decimal WinRate { get; set; } // Процент прибыльных сделок
+            public decimal SharpeRatio { get; set; } // Коэффициент Шарпа
+            public decimal SortinoRatio { get; set; } // Коэффициент Сортино
+            public decimal ProfitFactor { get; set; } // Отношение прибыли к убыткам
+            public decimal AvgTradeDuration { get; set; } // Средняя длительность сделки в минутах
+            public string TimeFrame { get; set; } // Используемый таймфрейм
+            public List<TradeRecord> Trades { get; set; } = new(); // Список всех сделок
         }
 
+        /// <summary>
+        /// Анализ проскальзывания
+        /// </summary>
+        public class SlippageAnalysis
+        {
+            public decimal MarketOrderSlippage { get; set; } // % проскальзывания для рыночного ордера
+            public decimal LimitOrderSlippage { get; set; } // % проскальзывания для лимитного ордера
+            public decimal TwapSlippage { get; set; } // % проскальзывания для TWAP
+            public decimal EstimatedFillRatio { get; set; } // Ожидаемый % исполнения
+        }
+
+        /// <summary>
+        /// Результат Monte-Carlo симуляции
+        /// </summary>
         public class MonteCarloResult
         {
             public bool Success { get; set; }
-            public decimal MinFinalBalance { get; set; }
-            public decimal MaxFinalBalance { get; set; }
-            public decimal AvgFinalBalance { get; set; }
-            public decimal ProbabilityOfProfit { get; set; }
-            public Dictionary<decimal, int> MaxDrawdownDistribution { get; set; }
-            public string Error { get; set; }
+            public decimal BestCase { get; set; } // Лучший сценарий (макс. баланс)
+            public decimal WorstCase { get; set; } // Худший сценарий (мин. баланс)
+            public decimal Median { get; set; } // Медианный результат
+            public decimal ProbabilityOfProfit { get; set; } // Вероятность прибыльности
         }
 
-        /// <summary> </summary>
-        public class NewsMonitor
+        /// <summary>
+        /// Мониторинг криптовалютных новостей и анализ их влияния на рынок
+        /// </summary>
+        public class NewsMonitor : IDisposable
         {
             private readonly ILogger _logger;
-            private readonly ConcurrentDictionary<string, NewsEvent> _activeNews = new();
             private readonly HttpClient _httpClient;
+            private readonly ConcurrentDictionary<string, NewsEvent> _activeNews = new();
             private Timer _monitoringTimer;
             private bool _isMonitoring;
-            private readonly string[] _trustedSources = { "Coindesk", "Cointelegraph", "Binance Blog" };
+            private readonly string[] _highImpactKeywords = { "hack", "exploit", "regulation", "ban", "partnership", "listing", "halving" };
+
+            // Настройки API (можно вынести в конфиг)
+            private const string CryptoPanicApiKey = "YOUR_API_KEY";
+            private const string NewsApiUrl = "https://cryptopanic.com/api/v1/posts/?auth_token=" + CryptoPanicApiKey;
+            private const int MonitoringIntervalMinutes = 5;
 
             public NewsMonitor(ILogger logger)
             {
                 _logger = logger;
-                _httpClient = new HttpClient
-                {
-                    Timeout = TimeSpan.FromSeconds(10)
-                };
+                _httpClient = new HttpClient();
+                _httpClient.Timeout = TimeSpan.FromSeconds(10);
             }
 
+            /// <summary>
+            /// Запуск фонового мониторинга новостей
+            /// </summary>
             public void StartMonitoring()
             {
+                if (_isMonitoring) return;
+
                 _isMonitoring = true;
-                _monitoringTimer = new Timer(CheckNews, null, TimeSpan.Zero, TimeSpan.FromMinutes(5));
-                _logger.LogInformation("Мониторинг новостей запущен");
+                _monitoringTimer = new Timer(CheckNews, null, TimeSpan.Zero, TimeSpan.FromMinutes(MonitoringIntervalMinutes));
+                _logger.LogInformation("Мониторинг новостей запущен с интервалом {0} минут", MonitoringIntervalMinutes);
             }
 
+            /// <summary>
+            /// Остановка мониторинга новостей
+            /// </summary>
             public void StopMonitoring()
             {
                 _isMonitoring = false;
@@ -4404,172 +5334,267 @@ namespace AdvancedCryptoTradingBot
                 _logger.LogInformation("Мониторинг новостей остановлен");
             }
 
+            /// <summary>
+            /// Проверка новых новостей по таймеру
+            /// </summary>
             private async void CheckNews(object state)
             {
                 if (!_isMonitoring) return;
 
                 try
                 {
-                    var newEvents = await FetchNewsEvents();
-                    await ProcessNewEvents(newEvents);
-                    CleanupExpiredEvents();
+                    // Запрос к CryptoPanic API
+                    var response = await _httpClient.GetStringAsync(NewsApiUrl);
+                    var newsResponse = JsonConvert.DeserializeObject<CryptoPanicResponse>(response);
+
+                    if (newsResponse?.Results == null) return;
+
+                    // Обработка новых событий
+                    foreach (var item in newsResponse.Results)
+                    {
+                        // Пропускаем уже обработанные новости
+                        if (_activeNews.ContainsKey(item.Id)) continue;
+
+                        var newsEvent = MapToNewsEvent(item);
+
+                        // Анализ важности новости
+                        AnalyzeNewsImpact(newsEvent);
+
+                        // Добавление в активные события
+                        _activeNews.TryAdd(item.Id, newsEvent);
+
+                        _logger.LogInformation("Обнаружена новость: {0} (Важность: {1})",
+                            newsEvent.Title, newsEvent.ImpactLevel);
+                    }
+
+                    // Удаление устаревших новостей
+                    CleanupExpiredNews();
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Ошибка мониторинга новостей");
+                    _logger.LogError(ex, "Ошибка при проверке новостей");
                 }
             }
 
-            private async Task<List<NewsEvent>> FetchNewsEvents()
+            /// <summary>
+            /// Анализ влияния новости на рынок
+            /// </summary>
+            private void AnalyzeNewsImpact(NewsEvent newsEvent)
             {
                 try
                 {
-                    // Интеграция с CryptoPanic API
-                    var response = await _httpClient.GetAsync(
-                        "https://cryptopanic.com/api/v1/posts/?auth_token=YOUR_API_KEY&currencies=BTC,ETH,BNB");
+                    // Базовый уровень важности
+                    newsEvent.ImpactLevel = 1; // По умолчанию низкая важность
 
-                    if (!response.IsSuccessStatusCode)
-                        return new List<NewsEvent>();
-
-                    var content = await response.Content.ReadAsStringAsync();
-                    var apiResponse = JsonConvert.DeserializeObject<CryptoPanicResponse>(content);
-
-                    return apiResponse.Results.Select(n => new NewsEvent
+                    // Повышаем важность для ключевых слов в заголовке
+                    if (_highImpactKeywords.Any(kw =>
+                        newsEvent.Title.Contains(kw, StringComparison.OrdinalIgnoreCase)))
                     {
-                        NewsId = n.Id.ToString(),
-                        Title = n.Title,
-                        Source = MapSource(n.Source.Domain),
-                        PublishedAt = DateTime.Parse(n.PublishedAt),
-                        ExpiresAt = DateTime.Parse(n.PublishedAt).AddHours(6),
-                        ImpactLevel = CalculateImpactLevel(n),
-                        Symbol = n.Currencies.FirstOrDefault()?.Code ?? "GENERAL",
-                        IsVerified = _trustedSources.Contains(n.Source.Title)
-                    }).ToList();
-                }
-                catch
-                {
-                    return new List<NewsEvent>();
-                }
-            }
-
-            private async Task ProcessNewEvents(List<NewsEvent> newEvents)
-            {
-                foreach (var news in newEvents)
-                {
-                    if (_activeNews.ContainsKey(news.NewsId))
-                        continue;
-
-                    // Анализ тональности
-                    news.SentimentScore = await AnalyzeSentiment(news.Title);
-                    _activeNews[news.NewsId] = news;
-
-                    if (news.ImpactLevel >= 3)
-                    {
-                        _logger.LogWarning($"Важная новость: {news.Title} (Impact: {news.ImpactLevel})");
+                        newsEvent.ImpactLevel += 1;
                     }
+
+                    // Повышаем важность для проверенных источников
+                    if (IsVerifiedSource(newsEvent.Source))
+                    {
+                        newsEvent.ImpactLevel += 1;
+                    }
+
+                    // Анализ тональности заголовка
+                    newsEvent.SentimentScore = AnalyzeSentiment(newsEvent.Title);
+                    if (Math.Abs(newsEvent.SentimentScore) > 0.5m)
+                    {
+                        newsEvent.ImpactLevel += 1;
+                    }
+
+                    // Ограничиваем максимальный уровень важности
+                    newsEvent.ImpactLevel = Math.Min(newsEvent.ImpactLevel, 5);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка анализа новости");
                 }
             }
 
-            private async Task<decimal> AnalyzeSentiment(string text)
+            /// <summary>
+            /// Простой анализ тональности текста
+            /// </summary>
+            private decimal AnalyzeSentiment(string text)
             {
-                try
+                // Упрощенная реализация - в продакшене лучше использовать NLP API
+                var positiveWords = new[] { "bullish", "growth", "adoption", "partnership", "approve" };
+                var negativeWords = new[] { "bearish", "hack", "scam", "ban", "regulation", "sell-off" };
+
+                int positiveCount = positiveWords.Count(w => text.Contains(w, StringComparison.OrdinalIgnoreCase));
+                int negativeCount = negativeWords.Count(w => text.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+                return (positiveCount - negativeCount) switch
                 {
-                    // Упрощенная реализация - в продакшене использовать NLP API
-                    var negativeWords = new[] { "crash", "drop", "bear", "fraud", "hack" };
-                    var positiveWords = new[] { "rise", "bull", "adopt", "institutional", "partnership" };
-
-                    decimal score = 0;
-                    score += positiveWords.Count(w => text.Contains(w, StringComparison.OrdinalIgnoreCase)) * 0.1m;
-                    score -= negativeWords.Count(w => text.Contains(w, StringComparison.OrdinalIgnoreCase)) * 0.1m;
-
-                    return Math.Clamp(score, -1, 1);
-                }
-                catch
-                {
-                    return 0;
-                }
-            }
-
-            private int CalculateImpactLevel(dynamic newsItem)
-            {
-                // Эвристический расчет важности новости
-                int impact = 1;
-
-                if (newsItem.Votes.Important > 5) impact++;
-                if (newsItem.Source.Title.Contains("Bloomberg")) impact++;
-                if (newsItem.Title.Contains("BTC") || newsItem.Title.Contains("Bitcoin")) impact++;
-
-                return Math.Clamp(impact, 1, 5);
-            }
-
-            private void CleanupExpiredEvents()
-            {
-                var expired = _activeNews.Where(kv => kv.Value.ExpiresAt < DateTime.UtcNow).ToList();
-                foreach (var kv in expired)
-                {
-                    _activeNews.TryRemove(kv.Key, out _);
-                }
-            }
-
-            private string MapSource(string domain)
-            {
-                return domain switch
-                {
-                    var d when d.Contains("coindesk") => "Coindesk",
-                    var d when d.Contains("cointelegraph") => "Cointelegraph",
-                    var d when d.Contains("binance") => "Binance Blog",
-                    _ => "Other"
+                    > 0 => 0.5m + (Math.Min(positiveCount, 3) * 0.15m), // Макс +0.95
+                    < 0 => -0.5m - (Math.Min(negativeCount, 3) * 0.15m), // Мин -0.95
+                    _ => 0m
                 };
             }
 
+            /// <summary>
+            /// Проверка надежности источника
+            /// </summary>
+            private bool IsVerifiedSource(NewsSource source)
+            {
+                return source switch
+                {
+                    NewsSource.OfficialAnnouncement => true,
+                    NewsSource.CryptoPanic => true,
+                    _ => false
+                };
+            }
+
+            /// <summary>
+            /// Удаление устаревших новостей
+            /// </summary>
+            private void CleanupExpiredNews()
+            {
+                try
+                {
+                    var cutoffTime = DateTime.UtcNow.AddHours(-6); // Новости старше 6 часов удаляем
+                    var expiredIds = _activeNews
+                        .Where(kv => kv.Value.PublishedAt < cutoffTime)
+                        .Select(kv => kv.Key)
+                        .ToList();
+
+                    foreach (var id in expiredIds)
+                    {
+                        _activeNews.TryRemove(id, out _);
+                    }
+
+                    if (expiredIds.Count > 0)
+                    {
+                        _logger.LogDebug("Удалено {0} устаревших новостей", expiredIds.Count);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка очистки новостей");
+                }
+            }
+
+            /// <summary>
+            /// Проверка наличия важных новостей
+            /// </summary>
             public bool IsHighImpactNewsPending()
             {
                 return _activeNews.Any(kv => kv.Value.ImpactLevel >= 3);
             }
 
+            /// <summary>
+            /// Получение списка символов, затронутых важными новостями
+            /// </summary>
             public List<string> GetAffectedSymbols()
             {
                 return _activeNews
                     .Where(kv => kv.Value.ImpactLevel >= 3)
-                    .Select(kv => kv.Value.Symbol)
+                    .SelectMany(kv => kv.Value.RelatedAssets)
                     .Distinct()
                     .ToList();
             }
 
+            /// <summary>
+            /// Проверка, затронут ли символ важными новостями
+            /// </summary>
             public bool IsSymbolAffected(string symbol)
             {
                 return _activeNews.Any(kv =>
                     kv.Value.ImpactLevel >= 2 &&
-                    (kv.Value.Symbol == symbol || kv.Value.Symbol == "GENERAL"));
+                    kv.Value.RelatedAssets.Contains(symbol));
             }
 
-            public List<NewsEvent> GetRecentNews(int count)
+            /// <summary>
+            /// Получение всех активных новостей для указанного символа
+            /// </summary>
+            public List<NewsEvent> GetNewsForSymbol(string symbol)
             {
-                return _activeNews.Values
-                    .OrderByDescending(n => n.ImpactLevel)
-                    .ThenByDescending(n => n.PublishedAt)
-                    .Take(count)
+                return _activeNews
+                    .Where(kv => kv.Value.RelatedAssets.Contains(symbol))
+                    .OrderByDescending(kv => kv.Value.ImpactLevel)
+                    .Select(kv => kv.Value)
                     .ToList();
             }
 
-            private class CryptoPanicResponse
+            /// <summary>
+            /// Преобразование DTO в модель новости
+            /// </summary>
+            private NewsEvent MapToNewsEvent(CryptoPanicItem item)
             {
-                public List<CryptoPanicNews> Results { get; set; }
+                var currencies = item.Currencies?.Select(c => c.Code.ToUpper()).ToArray() ?? Array.Empty<string>();
+
+                return new NewsEvent
+                {
+                    Id = item.Id,
+                    Title = item.Title,
+                    Source = MapSource(item.Source.Domain),
+                    PublishedAt = DateTime.Parse(item.PublishedAt),
+                    ExpiresAt = DateTime.Parse(item.PublishedAt).AddHours(6), // Новость актуальна 6 часов
+                    RelatedAssets = currencies,
+                    Url = item.Url
+                };
             }
 
-            private class CryptoPanicNews
+            /// <summary>
+            /// Определение типа источника
+            /// </summary>
+            private NewsSource MapSource(string domain)
             {
-                public int Id { get; set; }
+                if (string.IsNullOrEmpty(domain)) return NewsSource.Other;
+
+                return domain.ToLower() switch
+                {
+                    "twitter.com" => NewsSource.Twitter,
+                    "cointelegraph.com" => NewsSource.CryptoPanic,
+                    "blog.bitmex.com" => NewsSource.OfficialAnnouncement,
+                    _ => NewsSource.Other
+                };
+            }
+
+            public void Dispose()
+            {
+                StopMonitoring();
+                _httpClient?.Dispose();
+            }
+
+            #region Модели данных
+
+            public class NewsEvent
+            {
+                public string Id { get; set; }
+                public string Title { get; set; }
+                public NewsSource Source { get; set; }
+                public string[] RelatedAssets { get; set; }
+                public DateTime PublishedAt { get; set; }
+                public DateTime ExpiresAt { get; set; }
+                public int ImpactLevel { get; set; } // 1-5 (5 - максимальное влияние)
+                public decimal SentimentScore { get; set; } // -1 до +1
+                public string Url { get; set; }
+                public bool IsVerified { get; set; }
+            }
+
+
+            // Модели для десериализации ответа CryptoPanic API
+            private class CryptoPanicResponse
+            {
+                public List<CryptoPanicItem> Results { get; set; }
+            }
+
+            private class CryptoPanicItem
+            {
+                public string Id { get; set; }
                 public string Title { get; set; }
                 public string PublishedAt { get; set; }
                 public CryptoPanicSource Source { get; set; }
                 public List<CryptoPanicCurrency> Currencies { get; set; }
-                public CryptoPanicVotes Votes { get; set; }
+                public string Url { get; set; }
             }
 
             private class CryptoPanicSource
             {
-                public string Title { get; set; }
                 public string Domain { get; set; }
             }
 
@@ -4578,240 +5603,1800 @@ namespace AdvancedCryptoTradingBot
                 public string Code { get; set; }
             }
 
-            private class CryptoPanicVotes
-            {
-                public int Important { get; set; }
-            }
+            #endregion
         }
+
 
 
         #endregion
 
         #region Data Models
-        public enum TradeDirection { Long, Short }
+        /// <summary>
+        /// Направление торговой операции
+        /// </summary>
+        public enum TradeDirection
+        {
+            /// <summary>
+            /// Покупка (длинная позиция) - трейдер ожидает рост цены
+            /// Пример: Покупка BTC по $30,000 с целью продажи по $35,000
+            /// </summary>
+            Long = 0,
 
+            /// <summary>
+            /// Продажа (короткая позиция) - трейдер ожидает падение цены
+            /// Пример: Продажа BTC по $30,000 с целью выкупа по $25,000
+            /// 
+            /// Примечание: На спотовых рынках требует маржинального кредитования,
+            /// на фьючерсных рынках доступно без заимствования актива
+            /// </summary>
+            Short = 1
+        }
+
+        /// <summary>
+        /// Класс для хранения и обработки рыночных данных по одному временному интервалу
+        /// </summary>
         public class MarketDataPoint
         {
+            /// <summary>
+            /// Торговая пара (например, BTCUSDT)
+            /// </summary>
             public string Symbol { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Временной интервал (таймфрейм) данных
+            /// </summary>
             public KlineInterval TimeFrame { get; set; }
+
+            /// <summary>
+            /// Время открытия свечи
+            /// </summary>
             public DateTime OpenTime { get; set; }
+
+            /// <summary>
+            /// Цена открытия
+            /// </summary>
             public decimal Open { get; set; }
+
+            /// <summary>
+            /// Максимальная цена за период
+            /// </summary>
             public decimal High { get; set; }
+
+            /// <summary>
+            /// Минимальная цена за период
+            /// </summary>
             public decimal Low { get; set; }
+
+            /// <summary>
+            /// Цена закрытия
+            /// </summary>
             public decimal Close { get; set; }
+
+            /// <summary>
+            /// Объем торгов за период
+            /// </summary>
             public decimal Volume { get; set; }
+
+            /// <summary>
+            /// Флаг завершенности свечи (true - свеча закрыта)
+            /// </summary>
             public bool IsClosed { get; set; }
 
-            // Технические индикаторы
+            // --------------------------------------------------
+            // Технические индикаторы (рассчитываются процессором)
+            // --------------------------------------------------
+
+            /// <summary>
+            /// Relative Strength Index (индекс относительной силы)
+            /// Значения:
+            /// - >70 - перекупленность
+            /// - <30 - перепроданность
+            /// </summary>
             public decimal RSI { get; set; }
+
+            /// <summary>
+            /// Moving Average Convergence Divergence (схождение/расхождение скользящих средних)
+            /// </summary>
             public decimal MACD { get; set; }
-            public decimal Signal { get; set; } // Добавлено для MACD
+
+            /// <summary>
+            /// Сигнальная линия MACD
+            /// </summary>
+            public decimal Signal { get; set; }
+
+            /// <summary>
+            /// Average True Range (средний истинный диапазон) - показатель волатильности
+            /// </summary>
             public decimal ATR { get; set; }
+
+            /// <summary>
+            /// Простая скользящая средняя за 50 периодов
+            /// </summary>
             public decimal SMA50 { get; set; }
+
+            /// <summary>
+            /// Простая скользящая средняя за 200 периодов
+            /// </summary>
             public decimal SMA200 { get; set; }
 
-            // Новые поля:
-            public decimal OBV { get; set; } // On-Balance Volume для анализа объема
-            public decimal VWAP { get; set; } // Средневзвешенная цена
-            public decimal OrderBookImbalance { get; set; } // Дисбаланс стакана
+            /// <summary>
+            /// On-Balance Volume (балансовый объем) - индикатор объема
+            /// </summary>
+            public decimal OBV { get; set; }
+
+            /// <summary>
+            /// Volume Weighted Average Price (средневзвешенная цена по объему)
+            /// </summary>
+            public decimal VWAP { get; set; }
+
+            /// <summary>
+            /// Дисбаланс стакана цен (отношение объема покупок к продажам)
+            /// Значения:
+            /// - >0 - преобладают покупки
+            /// - <0 - преобладают продажи
+            /// </summary>
+            public decimal OrderBookImbalance { get; set; }
+
+            /// <summary>
+            /// Конструктор по умолчанию
+            /// </summary>
+            public MarketDataPoint() { }
+
+            /// <summary>
+            /// Конструктор для быстрого создания объекта из данных Binance Kline
+            /// </summary>
+            /// <param name="kline">Данные свечи от Binance</param>
+            /// <param name="symbol">Торговая пара</param>
+            /// <param name="timeFrame">Таймфрейм</param>
+            public MarketDataPoint(IBinanceKline kline, string symbol, KlineInterval timeFrame)
+            {
+                Symbol = symbol;
+                TimeFrame = timeFrame;
+                OpenTime = kline.OpenTime;
+                Open = kline.OpenPrice;
+                High = kline.HighPrice;
+                Low = kline.LowPrice;
+                Close = kline.ClosePrice;
+                Volume = kline.Volume;
+                IsClosed = kline.Final;
+            }
+
+            /// <summary>
+            /// Проверяет, является ли свеча бычьей (закрытие выше открытия)
+            /// </summary>
+            public bool IsBullish => Close > Open;
+
+            /// <summary>
+            /// Проверяет, является ли свеча медвежьей (закрытие ниже открытия)
+            /// </summary>
+            public bool IsBearish => Close < Open;
+
+            /// <summary>
+            /// Возвращает тело свечи (разница между ценой открытия и закрытия)
+            /// </summary>
+            public decimal Body => Math.Abs(Close - Open);
+
+            /// <summary>
+            /// Возвращает верхнюю тень свечи (разница между high и телом)
+            /// </summary>
+            public decimal UpperShadow => High - (IsBullish ? Close : Open);
+
+            /// <summary>
+            /// Возвращает нижнюю тень свечи (разница между low и телом)
+            /// </summary>
+            public decimal LowerShadow => (IsBullish ? Open : Close) - Low;
+
+            /// <summary>
+            /// Проверяет, является ли свеча доджем (маленькое тело)
+            /// </summary>
+            /// <param name="threshold">Порог для определения доджа (по умолчанию 0.1%)</param>
+            public bool IsDoji(decimal threshold = 0.001m)
+            {
+                decimal range = High - Low;
+                return range > 0 && (Body / range) < threshold;
+            }
+
+            /// <summary>
+            /// Возвращает строковое представление объекта
+            /// </summary>
+            public override string ToString()
+            {
+                return $"{Symbol} {TimeFrame} {OpenTime}: O={Open}, H={High}, L={Low}, C={Close}, V={Volume}";
+            }
         }
 
+        /// <summary>
+        /// Модель торгового сигнала, генерируемого стратегией
+        /// </summary>
         public class TradingSignal
         {
+            /// <summary>
+            /// Идентификатор торговой пары (например, BTCUSDT)
+            /// </summary>
             public string Symbol { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Направление сделки (Покупка/Продажа)
+            /// </summary>
             public TradeDirection Direction { get; set; }
+
+            /// <summary>
+            /// Уверенность в сигнале (0-1, где 1 - максимальная уверенность)
+            /// </summary>
             public decimal Confidence { get; set; }
+
+            /// <summary>
+            /// Время генерации сигнала
+            /// </summary>
             public DateTime Timestamp { get; set; }
+
+            /// <summary>
+            /// Таймфрейм, на котором сгенерирован сигнал
+            /// </summary>
             public KlineInterval TimeFrame { get; set; }
 
-            // Новые поля:
-            public string StrategyId { get; set; } // Идентификатор стратегии
-            public decimal SuggestedPositionSize { get; set; } // Расчетный размер позиции
-            public Dictionary<string, object> Features { get; set; } = new(); // Доп. признаки для ML
+            /// <summary>
+            /// Идентификатор стратегии, сгенерировавшей сигнал
+            /// </summary>
+            public string StrategyId { get; set; }
 
-            // Для VWAP-исполнения
+            /// <summary>
+            /// Рекомендуемый размер позиции (в базовой валюте)
+            /// </summary>
+            public decimal SuggestedPositionSize { get; set; }
+
+            /// <summary>
+            /// Дополнительные признаки/метрики, использованные при генерации сигнала
+            /// </summary>
+            public Dictionary<string, object> Features { get; set; } = new Dictionary<string, object>();
+
+            /// <summary>
+            /// Флаг использования VWAP для исполнения (Volume Weighted Average Price)
+            /// </summary>
             public bool UseVwap { get; set; }
+
+            /// <summary>
+            /// Длительность VWAP-исполнения в минутах
+            /// </summary>
             public int VwapDurationMinutes { get; set; } = 5;
+
+            /// <summary>
+            /// Цена актива на момент генерации сигнала
+            /// </summary>
+            public decimal CurrentPrice { get; set; }
+
+            /// <summary>
+            /// Расчетный уровень стоп-лосса
+            /// </summary>
+            public decimal CalculatedStopLoss { get; set; }
+
+            /// <summary>
+            /// Расчетный уровень тейк-профита
+            /// </summary>
+            public decimal CalculatedTakeProfit { get; set; }
+
+            /// <summary>
+            /// Риск-профиль сигнала (Low/Medium/High)
+            /// </summary>
+            public RiskProfile RiskProfile { get; set; }
+
+            /// <summary>
+            /// Временная метка экспирации сигнала (если применимо)
+            /// </summary>
+            public DateTime? ExpirationTime { get; set; }
+
+            /// <summary>
+            /// Конструктор по умолчанию
+            /// </summary>
+            public TradingSignal()
+            {
+                Timestamp = DateTime.UtcNow;
+            }
+
+            /// <summary>
+            /// Конструктор с минимально необходимыми параметрами
+            /// </summary>
+            public TradingSignal(string symbol, TradeDirection direction, decimal confidence, KlineInterval timeFrame)
+            {
+                Symbol = symbol;
+                Direction = direction;
+                Confidence = confidence;
+                TimeFrame = timeFrame;
+                Timestamp = DateTime.UtcNow;
+                Features = new Dictionary<string, object>();
+            }
+
+            /// <summary>
+            /// Добавляет признак/метрику в словарь features
+            /// </summary>
+            public void AddFeature(string key, object value)
+            {
+                Features[key] = value;
+            }
+
+            /// <summary>
+            /// Возвращает значение признака или default, если не существует
+            /// </summary>
+            public T GetFeature<T>(string key, T defaultValue = default)
+            {
+                return Features.TryGetValue(key, out var value) ? (T)value : defaultValue;
+            }
+
+            /// <summary>
+            /// Рассчитывает риск-профиль на основе волатильности и уверенности
+            /// </summary>
+            public void CalculateRiskProfile(decimal volatility)
+            {
+                var riskScore = volatility * (1 - Confidence);
+
+                RiskProfile = riskScore switch
+                {
+                    < 0.2m => RiskProfile.Low,
+                    < 0.5m => RiskProfile.Medium,
+                    _ => RiskProfile.High
+                };
+            }
+
+            /// <summary>
+            /// Проверяет, действителен ли сигнал (не истекло ли время)
+            /// </summary>
+            public bool IsValid()
+            {
+                return !ExpirationTime.HasValue || DateTime.UtcNow <= ExpirationTime.Value;
+            }
+
+            /// <summary>
+            /// Возвращает строковое представление сигнала
+            /// </summary>
+            public override string ToString()
+            {
+                return $"{Symbol} {Direction} | Confidence: {Confidence:P0} | TimeFrame: {TimeFrame} | Strategy: {StrategyId}";
+            }
         }
 
+
+        /// <summary>
+        /// Уровень риска сигнала
+        /// </summary>
+        public enum RiskProfile
+        {
+            Low,    // Низкий риск
+            Medium, // Средний риск
+            High    // Высокий риск
+        }
+
+        /// <summary>
+        /// Дополнительные метаданные сигнала
+        /// </summary>
+        public class SignalMetadata
+        {
+            /// <summary>
+            /// Время генерации сигнала стратегией
+            /// </summary>
+            public DateTime GenerationTime { get; set; }
+
+            /// <summary>
+            /// Время последнего обновления
+            /// </summary>
+            public DateTime LastUpdated { get; set; }
+
+            /// <summary>
+            /// Количество подтверждений от других стратегий
+            /// </summary>
+            public int Confirmations { get; set; }
+
+            /// <summary>
+            /// Список идентификаторов подтвердивших стратегий
+            /// </summary>
+            public List<string> ConfirmedBy { get; set; } = new List<string>();
+
+            /// <summary>
+            /// Флаг ручного подтверждения
+            /// </summary>
+            public bool ManuallyConfirmed { get; set; }
+
+            /// <summary>
+            /// Комментарии/заметки к сигналу
+            /// </summary>
+            public string Notes { get; set; }
+        }
+
+        /// <summary>
+        /// Комплексные метрики риска для портфеля и торговых решений
+        /// </summary>
         public class RiskMetrics
         {
+            /// <summary>
+            /// Текущая волатильность (стандартное отклонение доходностей) в %
+            /// </summary>
             public decimal Volatility { get; set; }
+
+            /// <summary>
+            /// Доступная ликвидность в стакане (сумма в USDT в пределах ±1% от текущей цены)
+            /// </summary>
             public decimal Liquidity { get; set; }
+
+            /// <summary>
+            /// Общий риск портфеля (0-1, где 1 = 100% риска)
+            /// </summary>
             public decimal PortfolioRisk { get; set; }
+
+            /// <summary>
+            /// Текущая стоимость портфеля в USDT
+            /// </summary>
             public decimal PortfolioValue { get; set; }
+
+            /// <summary>
+            /// Conditional Value at Risk - ожидаемые потери при неблагоприятных условиях
+            /// </summary>
             public decimal CVaR { get; set; }
+
+            /// <summary>
+            /// Матрица корреляций между всеми торговыми инструментами
+            /// Ключ: Symbol, Значение: Словарь корреляций с другими символами
+            /// </summary>
             public Dictionary<string, Dictionary<string, decimal>> CorrelationMatrix { get; set; } = new();
+
+            /// <summary>
+            /// Список открытых позиций
+            /// </summary>
             public List<OpenPosition> OpenPositions { get; set; } = new();
+
+            /// <summary>
+            /// Текущий рыночный тренд (бычий/медвежий/нейтральный)
+            /// </summary>
             public MarketTrend MarketTrend { get; set; }
 
-            // Новые поля:
-            public decimal PortfolioBeta { get; set; } // Бета портфеля
-            public decimal StressTestResult { get; set; } // Результат стресс-теста
-            public decimal MarginUsage { get; set; } // Использование маржи
-            public decimal DailyProfitLoss { get; set; } // Дневной PnL
+            /// <summary>
+            /// Бета портфеля - чувствительность к рыночным движениям
+            /// >1 - более волатильный чем рынок, <1 - менее волатильный
+            /// </summary>
+            public decimal PortfolioBeta { get; set; }
+
+            /// <summary>
+            /// Результат последнего стресс-теста (максимальная просадка в %)
+            /// </summary>
+            public decimal StressTestResult { get; set; }
+
+            /// <summary>
+            /// Процент использования маржи (0-1)
+            /// </summary>
+            public decimal MarginUsage { get; set; }
+
+            /// <summary>
+            /// Прибыль/убыток за текущий день в USDT
+            /// </summary>
+            public decimal DailyProfitLoss { get; set; }
+
+            /// <summary>
+            /// Уровень влияния последних новостей (0-5)
+            /// 0 - нет влияния, 5 - критическое влияние
+            /// </summary>
+            public int NewsImpactLevel { get; set; }
+
+            /// <summary>
+            /// Максимальный рекомендуемый размер позиции в % от портфеля
+            /// </summary>
+            public decimal MaxRecommendedPositionSize { get; set; }
+
+            /// <summary>
+            /// Средний риск/прибыль по открытым позициям
+            /// </summary>
+            public decimal AverageRiskRewardRatio { get; set; }
+
+            /// <summary>
+            /// Рассчитывает коэффициент Шарпа для портфеля
+            /// </summary>
+            /// <param name="riskFreeRate">Безрисковая ставка (по умолчанию 0)</param>
+            /// <returns>Коэффициент Шарпа</returns>
+            public decimal CalculateSharpeRatio(decimal riskFreeRate = 0)
+            {
+                if (Volatility == 0) return 0;
+                return (DailyProfitLoss / PortfolioValue - riskFreeRate) / Volatility;
+            }
+
+            /// <summary>
+            /// Рассчитывает коэффициент Сортино (аналог Шарпа, но учитывает только негативную волатильность)
+            /// </summary>
+            public decimal CalculateSortinoRatio(decimal riskFreeRate = 0)
+            {
+                if (Volatility == 0) return 0;
+                return (DailyProfitLoss / PortfolioValue - riskFreeRate) / (Volatility * 0.5m);
+            }
+
+            /// <summary>
+            /// Обновляет матрицу корреляций на основе исторических данных
+            /// </summary>
+            /// <param name="historicalData">Исторические данные по всем символам</param>
+            public void UpdateCorrelationMatrix(Dictionary<string, List<MarketDataPoint>> historicalData)
+            {
+                var symbols = historicalData.Keys.ToList();
+                CorrelationMatrix.Clear();
+
+                foreach (var symbol1 in symbols)
+                {
+                    CorrelationMatrix[symbol1] = new Dictionary<string, decimal>();
+                    var prices1 = historicalData[symbol1]
+                        .Where(d => d.TimeFrame == KlineInterval.OneHour)
+                        .Select(d => d.Close)
+                        .TakeLast(100)
+                        .ToArray();
+
+                    foreach (var symbol2 in symbols)
+                    {
+                        if (symbol1 == symbol2)
+                        {
+                            CorrelationMatrix[symbol1][symbol2] = 1m;
+                            continue;
+                        }
+
+                        var prices2 = historicalData[symbol2]
+                            .Where(d => d.TimeFrame == KlineInterval.OneHour)
+                            .Select(d => d.Close)
+                            .TakeLast(100)
+                            .ToArray();
+
+                        if (prices1.Length != prices2.Length || prices1.Length < 10)
+                        {
+                            CorrelationMatrix[symbol1][symbol2] = 0m;
+                            continue;
+                        }
+
+                        CorrelationMatrix[symbol1][symbol2] = CalculatePearsonCorrelation(prices1, prices2);
+                    }
+                }
+            }
+
+            /// <summary>
+            /// Рассчитывает корреляцию Пирсона между двумя наборами цен
+            /// </summary>
+            private decimal CalculatePearsonCorrelation(decimal[] x, decimal[] y)
+            {
+                try
+                {
+                    if (x.Length != y.Length || x.Length < 2)
+                        return 0m;
+
+                    decimal sumX = 0, sumY = 0, sumXY = 0;
+                    decimal sumX2 = 0, sumY2 = 0;
+
+                    for (int i = 0; i < x.Length; i++)
+                    {
+                        sumX += x[i];
+                        sumY += y[i];
+                        sumXY += x[i] * y[i];
+                        sumX2 += x[i] * x[i];
+                        sumY2 += y[i] * y[i];
+                    }
+
+                    decimal numerator = sumXY - (sumX * sumY / x.Length);
+                    decimal denominatorX = (sumX2 - (sumX * sumX / x.Length));
+                    decimal denominatorY = (sumY2 - (sumY * sumY / x.Length));
+
+                    if (denominatorX == 0 || denominatorY == 0)
+                        return 0m;
+
+                    return numerator / (decimal)Math.Sqrt((double)(denominatorX * denominatorY));
+                }
+                catch
+                {
+                    return 0m;
+                }
+            }
+
+            /// <summary>
+            /// Рассчитывает максимальную рекомендуемую позицию для символа
+            /// </summary>
+            public void CalculateMaxPositionSize(string symbol, decimal currentPrice)
+            {
+                try
+                {
+                    // Базовый лимит 5% от портфеля
+                    decimal baseLimit = PortfolioValue * 0.05m / currentPrice;
+
+                    // Корректировка на волатильность
+                    decimal volatilityAdjustment = 1 - (Volatility / 0.2m); // Нормализуем к 20% волатильности
+                    volatilityAdjustment = Math.Max(0.1m, Math.Min(1m, volatilityAdjustment));
+
+                    // Корректировка на корреляцию
+                    decimal correlationAdjustment = 1m;
+                    foreach (var pos in OpenPositions)
+                    {
+                        decimal corr = CorrelationMatrix[symbol].GetValueOrDefault(pos.Symbol, 0m);
+                        correlationAdjustment *= 1 - (Math.Abs(corr) * 0.5m);
+                    }
+
+                    MaxRecommendedPositionSize = baseLimit * volatilityAdjustment * correlationAdjustment;
+                }
+                catch
+                {
+                    MaxRecommendedPositionSize = 0m;
+                }
+            }
+
+            /// <summary>
+            /// Рассчитывает средний риск/прибыль по открытым позициям
+            /// </summary>
+            public void UpdateRiskRewardRatios()
+            {
+                try
+                {
+                    if (!OpenPositions.Any())
+                    {
+                        AverageRiskRewardRatio = 0m;
+                        return;
+                    }
+
+                    decimal totalRatio = 0m;
+                    int count = 0;
+
+                    foreach (var pos in OpenPositions)
+                    {
+                        if (pos.TakeProfit == 0 || pos.StopLoss == 0) continue;
+
+                        decimal risk = Math.Abs(pos.EntryPrice - pos.StopLoss);
+                        decimal reward = Math.Abs(pos.TakeProfit - pos.EntryPrice);
+
+                        if (risk > 0)
+                        {
+                            totalRatio += reward / risk;
+                            count++;
+                        }
+                    }
+
+                    AverageRiskRewardRatio = count > 0 ? totalRatio / count : 0m;
+                }
+                catch
+                {
+                    AverageRiskRewardRatio = 0m;
+                }
+            }
+
+            /// <summary>
+            /// Проверяет необходимость хеджирования портфеля
+            /// </summary>
+            public bool NeedsHedging()
+            {
+                // Хеджирование требуется если:
+                // 1. Высокая волатильность
+                bool highVolatility = Volatility > 0.15m;
+
+                // 2. Большая концентрация в одном направлении
+                decimal longExposure = OpenPositions
+                    .Where(p => p.Direction == TradeDirection.Long)
+                    .Sum(p => p.Quantity * p.EntryPrice);
+
+                decimal shortExposure = OpenPositions
+                    .Where(p => p.Direction == TradeDirection.Short)
+                    .Sum(p => p.Quantity * p.EntryPrice);
+
+                bool unbalanced = Math.Abs(longExposure - shortExposure) > PortfolioValue * 0.3m;
+
+                // 3. Важные новости
+                bool importantNews = NewsImpactLevel >= 3;
+
+                return (highVolatility || importantNews) && unbalanced;
+            }
+
+            /// <summary>
+            /// Возвращает строковое представление ключевых метрик
+            /// </summary>
+            public override string ToString()
+            {
+                return $"Риск: {PortfolioRisk:P1} | Волатильность: {Volatility:P1} | " +
+                       $"CVaR: {CVaR:P1} | Бета: {PortfolioBeta:F2} | " +
+                       $"P/L: {DailyProfitLoss:F2} USDT | RR: {AverageRiskRewardRatio:F2}";
+            }
         }
 
+        /// <summary>
+        /// Тип рыночного тренда
+        /// </summary>
+        public enum MarketTrend
+        {
+            Bullish,    // Бычий
+            Bearish,    // Медвежий
+            Neutral     // Нейтральный
+        }
+
+        /// <summary>
+        /// Запрос на исполнение ордера с расширенными параметрами управления исполнением
+        /// </summary>
         public class OrderRequest
         {
+            /// <summary>
+            /// Торговая пара (например, BTCUSDT)
+            /// </summary>
             public string Symbol { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Направление сделки (Покупка/Продажа)
+            /// </summary>
             public OrderSide Side { get; set; }
+
+            /// <summary>
+            /// Количество актива для торговли
+            /// </summary>
             public decimal Quantity { get; set; }
+
+            /// <summary>
+            /// Цена входа (для лимитных ордеров)
+            /// </summary>
             public decimal Price { get; set; }
+
+            /// <summary>
+            /// Цена стоп-лосса (обязательно для всех ордеров)
+            /// </summary>
             public decimal StopLoss { get; set; }
+
+            /// <summary>
+            /// Цена тейк-профита (опционально)
+            /// </summary>
             public decimal TakeProfit { get; set; }
 
-            // Новые поля:
-            public string StrategyId { get; set; } // Для связи со стратегией
-            public bool UseVwap { get; set; } // Флаг VWAP-исполнения
-            public bool UseIceberg { get; set; } // Айсберг-ордера
+            /// <summary>
+            /// Использовать VWAP-алгоритм для крупных ордеров
+            /// (Volume Weighted Average Price - исполнение по средневзвешенной цене)
+            /// </summary>
+            public bool UseVwap { get; set; }
+
+            /// <summary>
+            /// Использовать Iceberg-ордер (скрытая часть объема)
+            /// </summary>
+            public bool UseIceberg { get; set; }
+
+            /// <summary>
+            /// Максимально допустимое проскальзывание в процентах (0.1 = 0.1%)
+            /// </summary>
             public decimal MaxSlippagePercent { get; set; } = 0.1m;
-            public KlineInterval TimeFrame { get; set; } // Таймфрейм сигнала
+
+            /// <summary>
+            /// Таймфрейм, на котором сгенерирован сигнал
+            /// </summary>
+            public KlineInterval TimeFrame { get; set; }
+
+            /// <summary>
+            /// Идентификатор стратегии, сгенерировавшей сигнал
+            /// </summary>
+            public string StrategyId { get; set; }
+
+            /// <summary>
+            /// Дополнительные параметры для алгоритмического исполнения
+            /// </summary>
+            public OrderExecutionParameters ExecutionParameters { get; set; } = new();
+
+            /// <summary>
+            /// Проверка валидности запроса перед исполнением
+            /// </summary>
+            public bool IsValid()
+            {
+                return !string.IsNullOrEmpty(Symbol) &&
+                       Quantity > 0 &&
+                       Price > 0 &&
+                       StopLoss > 0 &&
+                       (Side == OrderSide.Buy ? StopLoss < Price : StopLoss > Price);
+            }
         }
 
+        /// <summary>
+        /// Дополнительные параметры алгоритмического исполнения ордеров
+        /// </summary>
+        public class OrderExecutionParameters
+        {
+            /// <summary>
+            /// Максимальное время исполнения (в секундах)
+            /// </summary>
+            public int MaxExecutionTime { get; set; } = 30;
+
+            /// <summary>
+            /// Допустимое отклонение от цены (% от текущей цены)
+            /// </summary>
+            public decimal PriceDeviation { get; set; } = 0.05m;
+
+            /// <summary>
+            /// Агрессивность исполнения (0-1, где 1 - максимально агрессивно)
+            /// </summary>
+            public decimal Aggressiveness { get; set; } = 0.7m;
+
+            /// <summary>
+            /// Тип алгоритма исполнения:
+            /// - Passive: Ждать лучшей цены
+            /// - Neutral: Баланс цены и скорости
+            /// - Aggressive: Максимальная скорость
+            /// </summary>
+            public ExecutionAlgorithmType AlgorithmType { get; set; } = ExecutionAlgorithmType.Neutral;
+
+            /// <summary>
+            /// Размер минимального куска для VWAP/Iceberg ордеров
+            /// </summary>
+            public decimal MinimalChunkSize { get; set; }
+
+            /// <summary>
+            /// Интервал между частями ордера (в секундах)
+            /// </summary>
+            public int ChunkIntervalSeconds { get; set; } = 10;
+        }
+
+        /// <summary>
+        /// Тип алгоритма исполнения ордера
+        /// </summary>
+        public enum ExecutionAlgorithmType
+        {
+            /// <summary> Консервативный, минимизирует проскальзывание </summary>
+            Passive,
+            /// <summary> Баланс цены и скорости исполнения </summary>
+            Neutral,
+            /// <summary> Максимально быстрое исполнение </summary>
+            Aggressive,
+            /// <summary> Специальный режим для высоколиквидных пар </summary>
+            Liquid,
+            /// <summary> Для низколиквидных активов </summary>
+            Illiquid
+        }
+
+        /// <summary>
+        /// Результат исполнения торговой операции
+        /// </summary>
         public class TradeResult
         {
+            /// <summary>
+            /// Флаг успешного исполнения ордера
+            /// </summary>
             public bool Success { get; set; }
+
+            /// <summary>
+            /// Тикер торгового инструмента (например, BTCUSDT)
+            /// </summary>
             public string Symbol { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Направление сделки (BUY/SELL)
+            /// </summary>
             public string Side { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Исполненное количество актива
+            /// </summary>
             public decimal Quantity { get; set; }
+
+            /// <summary>
+            /// Средняя цена исполнения (включая все частичные исполнения)
+            /// </summary>
             public decimal AveragePrice { get; set; }
+
+            /// <summary>
+            /// Цена выхода из позиции (для закрытых позиций)
+            /// </summary>
             public decimal? ExitPrice { get; set; }
+
+            /// <summary>
+            /// Цена стоп-лосса
+            /// </summary>
             public decimal StopLoss { get; set; }
+
+            /// <summary>
+            /// Цена тейк-профита
+            /// </summary>
             public decimal TakeProfit { get; set; }
+
+            /// <summary>
+            /// Время открытия позиции
+            /// </summary>
             public DateTime EntryTime { get; set; }
+
+            /// <summary>
+            /// Время закрытия позиции (null для открытых позиций)
+            /// </summary>
             public DateTime? ExitTime { get; set; }
+
+            /// <summary>
+            /// Реализованная прибыль/убыток (null для открытых позиций)
+            /// </summary>
             public decimal? Profit { get; set; }
+
+            /// <summary>
+            /// Сумма комиссий по сделке
+            /// </summary>
             public decimal Commission { get; set; }
+
+            /// <summary>
+            /// Процент риска от размера депозита
+            /// </summary>
             public decimal RiskPercent { get; set; }
+
+            /// <summary>
+            /// Флаг успешности сделки (Profit > 0)
+            /// </summary>
             public bool IsSuccessful { get; set; }
+
+            /// <summary>
+            /// Уровень волатильности на момент открытия
+            /// </summary>
+            public decimal Volatility { get; set; }
+
+            /// <summary>
+            /// Уровень ликвидности на момент открытия
+            /// </summary>
+            public decimal Liquidity { get; set; }
+
+            /// <summary>
+            /// Величина проскальзывания (разница между ожидаемой и фактической ценой)
+            /// </summary>
             public decimal Slippage { get; set; }
+
+            /// <summary>
+            /// Таймфрейм, на котором был сгенерирован сигнал
+            /// </summary>
+            public string TimeFrame { get; set; }
+
+            /// <summary>
+            /// Причина закрытия позиции (для закрытых позиций)
+            /// </summary>
+            public string ExitReason { get; set; }
+
+            /// <summary>
+            /// Идентификатор стратегии, сгенерировавшей сигнал
+            /// </summary>
+            public string StrategyId { get; set; }
+
+            /// <summary>
+            /// Планируемый риск-ривард при открытии
+            /// </summary>
+            public decimal InitialRiskReward { get; set; }
+
+            /// <summary>
+            /// Фактический риск-ривард при закрытии
+            /// </summary>
+            public decimal RealizedRiskReward { get; set; }
+
+            /// <summary>
+            /// Время исполнения ордера в секундах
+            /// </summary>
+            public int ExecutionSeconds { get; set; }
+
+            /// <summary>
+            /// Сообщение об ошибке (если Success = false)
+            /// </summary>
             public string Error { get; set; }
+
+            /// <summary>
+            /// Дополнительные метаданные сделки
+            /// </summary>
+            public Dictionary<string, object> Metadata { get; set; } = new();
+
+            /// <summary>
+            /// Рассчитывает риск-ривард соотношение
+            /// </summary>
+            /// <returns>Risk-Reward ratio</returns>
+            public decimal CalculateRiskRewardRatio()
+            {
+                if (ExitPrice == null || StopLoss == 0) return 0;
+
+                decimal risk = Math.Abs(AveragePrice - StopLoss);
+                decimal reward = Math.Abs((ExitPrice ?? AveragePrice) - AveragePrice);
+
+                return reward / risk;
+            }
+
+            /// <summary>
+            /// Проверяет, была ли сделка закрыта по стоп-лоссу
+            /// </summary>
+            public bool IsStoppedOut()
+            {
+                if (ExitPrice == null) return false;
+
+                return (Side == "BUY" && ExitPrice <= StopLoss) ||
+                       (Side == "SELL" && ExitPrice >= StopLoss);
+            }
+
+            /// <summary>
+            /// Проверяет, была ли сделка закрыта по тейк-профиту
+            /// </summary>
+            public bool IsTakenProfit()
+            {
+                if (ExitPrice == null) return false;
+
+                return (Side == "BUY" && ExitPrice >= TakeProfit) ||
+                       (Side == "SELL" && ExitPrice <= TakeProfit);
+            }
+
+            /// <summary>
+            /// Возвращает продолжительность сделки (для закрытых позиций)
+            /// </summary>
+            public TimeSpan? GetTradeDuration()
+            {
+                return ExitTime != null ? ExitTime - EntryTime : null;
+            }
+
+            /// <summary>
+            /// Возвращает процентную прибыль/убыток
+            /// </summary>
+            public decimal? GetProfitPercentage()
+            {
+                if (ExitPrice == null) return null;
+
+                return Side == "BUY"
+                    ? (ExitPrice.Value - AveragePrice) / AveragePrice
+                    : (AveragePrice - ExitPrice.Value) / AveragePrice;
+            }
+
+            /// <summary>
+            /// Добавляет метаданные к сделке
+            /// </summary>
+            public void AddMetadata(string key, object value)
+            {
+                Metadata[key] = value;
+            }
+
+            /// <summary>
+            /// Возвращает строковое представление сделки
+            /// </summary>
+            public override string ToString()
+            {
+                return $"{Symbol} {Side} {Quantity} @ {AveragePrice} | " +
+                       $"SL: {StopLoss} TP: {TakeProfit} | " +
+                       $"PnL: {Profit?.ToString("F2") ?? "open"} | " +
+                       $"Reason: {ExitReason ?? "active"}";
+            }
         }
 
+        /// <summary>
+        /// Класс представляет открытую позицию на рынке
+        /// </summary>
         public class OpenPosition
         {
+            /// <summary>
+            /// Торговый символ (например, "BTCUSDT")
+            /// </summary>
             public string Symbol { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Количество актива в позиции
+            /// </summary>
             public decimal Quantity { get; set; }
+
+            /// <summary>
+            /// Цена входа в позицию
+            /// </summary>
             public decimal EntryPrice { get; set; }
+
+            /// <summary>
+            /// Время открытия позиции (UTC)
+            /// </summary>
             public DateTime EntryTime { get; set; }
+
+            /// <summary>
+            /// Цена стоп-лосса
+            /// </summary>
             public decimal StopLoss { get; set; }
+
+            /// <summary>
+            /// Цена тейк-профита
+            /// </summary>
             public decimal TakeProfit { get; set; }
+
+            /// <summary>
+            /// Направление позиции (лонг/шорт)
+            /// </summary>
             public TradeDirection Direction { get; set; }
+
+            /// <summary>
+            /// Дистанция до стоп-лосса в абсолютных значениях
+            /// (разница между ценой входа и стоп-лоссом)
+            /// </summary>
             public decimal StopLossDistance { get; set; }
 
-            // Новые поля:
-            public string StrategyId { get; set; } // Для связи со стратегией
-            public decimal CurrentRiskRewardRatio { get; set; } // Текущее RR
-            public bool IsHedged { get; set; } // Флаг хеджирования
-            public string HedgeSymbol { get; set; } // Пара для хеджа
+            /// <summary>
+            /// Идентификатор стратегии, которая открыла позицию
+            /// </summary>
+            public string StrategyId { get; set; }
+
+            /// <summary>
+            /// Текущее соотношение риск/прибыль (актуально для трейлинг-стопа)
+            /// </summary>
+            public decimal CurrentRiskRewardRatio { get; set; }
+
+            /// <summary>
+            /// Флаг, указывающий, хеджирована ли позиция
+            /// </summary>
+            public bool IsHedged { get; set; }
+
+            /// <summary>
+            /// Символ для хеджирования (если IsHedged = true)
+            /// </summary>
+            public string HedgeSymbol { get; set; }
+
+            /// <summary>
+            /// Комиссия за открытие позиции
+            /// </summary>
+            public decimal OpeningCommission { get; set; }
+
+            /// <summary>
+            /// Время последнего обновления позиции (UTC)
+            /// </summary>
+            public DateTime LastUpdated { get; set; }
+
+            /// <summary>
+            /// Причина открытия позиции (сигнал, ручная торговля и т.д.)
+            /// </summary>
+            public string OpeningReason { get; set; }
+
+            /// <summary>
+            /// Рассчитывает текущую прибыль/убыток позиции
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <returns>Значение PnL</returns>
+            public decimal CalculatePnL(decimal currentPrice)
+            {
+                return Direction == TradeDirection.Long
+                    ? (currentPrice - EntryPrice) * Quantity
+                    : (EntryPrice - currentPrice) * Quantity;
+            }
+
+            /// <summary>
+            /// Рассчитывает текущее соотношение риск/прибыль
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <returns>Значение Risk/Reward</returns>
+            public decimal CalculateRiskRewardRatio(decimal currentPrice)
+            {
+                decimal potentialProfit = Direction == TradeDirection.Long
+                    ? TakeProfit - EntryPrice
+                    : EntryPrice - TakeProfit;
+
+                decimal potentialLoss = Direction == TradeDirection.Long
+                    ? EntryPrice - StopLoss
+                    : StopLoss - EntryPrice;
+
+                if (potentialLoss == 0) return 0;
+
+                return potentialProfit / potentialLoss;
+            }
+
+            /// <summary>
+            /// Обновляет трейлинг-стоп
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <param name="trailingDistance">Дистанция трейлинга в процентах</param>
+            public void UpdateTrailingStop(decimal currentPrice, decimal trailingDistance = 1.5m)
+            {
+                if (Direction == TradeDirection.Long)
+                {
+                    decimal newStop = currentPrice - (StopLossDistance * trailingDistance);
+                    if (newStop > StopLoss)
+                    {
+                        StopLoss = newStop;
+                        LastUpdated = DateTime.UtcNow;
+                    }
+                }
+                else
+                {
+                    decimal newStop = currentPrice + (StopLossDistance * trailingDistance);
+                    if (newStop < StopLoss)
+                    {
+                        StopLoss = newStop;
+                        LastUpdated = DateTime.UtcNow;
+                    }
+                }
+
+                CurrentRiskRewardRatio = CalculateRiskRewardRatio(currentPrice);
+            }
+
+            /// <summary>
+            /// Проверяет, сработал ли стоп-лосс
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <returns>True, если стоп-лосс сработал</returns>
+            public bool IsStopLossTriggered(decimal currentPrice)
+            {
+                return Direction == TradeDirection.Long
+                    ? currentPrice <= StopLoss
+                    : currentPrice >= StopLoss;
+            }
+
+            /// <summary>
+            /// Проверяет, сработал ли тейк-профит
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <returns>True, если тейк-профит сработал</returns>
+            public bool IsTakeProfitTriggered(decimal currentPrice)
+            {
+                return Direction == TradeDirection.Long
+                    ? currentPrice >= TakeProfit
+                    : currentPrice <= TakeProfit;
+            }
+
+            /// <summary>
+            /// Возвращает процент риска позиции относительно цены входа
+            /// </summary>
+            public decimal GetRiskPercentage()
+            {
+                return Direction == TradeDirection.Long
+                    ? (EntryPrice - StopLoss) / EntryPrice * 100
+                    : (StopLoss - EntryPrice) / EntryPrice * 100;
+            }
+
+            /// <summary>
+            /// Возвращает процент потенциальной прибыли относительно цены входа
+            /// </summary>
+            public decimal GetRewardPercentage()
+            {
+                return Direction == TradeDirection.Long
+                    ? (TakeProfit - EntryPrice) / EntryPrice * 100
+                    : (EntryPrice - TakeProfit) / EntryPrice * 100;
+            }
+
+            /// <summary>
+            /// Возвращает продолжительность позиции в минутах
+            /// </summary>
+            public double GetPositionDurationMinutes()
+            {
+                return (DateTime.UtcNow - EntryTime).TotalMinutes;
+            }
+
+            /// <summary>
+            /// Проверяет, требует ли позиция хеджирования
+            /// </summary>
+            /// <param name="volatility">Текущая волатильность</param>
+            /// <param name="portfolioRisk">Риск портфеля</param>
+            /// <returns>True, если требуется хеджирование</returns>
+            public bool RequiresHedging(decimal volatility, decimal portfolioRisk)
+            {
+                // Позиция уже хеджирована
+                if (IsHedged) return false;
+
+                // Крупная позиция (>20% портфеля) с высоким риском
+                bool isLargePosition = GetRiskPercentage() > 20;
+
+                // Высокая волатильность
+                bool isHighVolatility = volatility > 0.05m;
+
+                // Высокий риск портфеля
+                bool isHighPortfolioRisk = portfolioRisk > 0.5m;
+
+                return isLargePosition && (isHighVolatility || isHighPortfolioRisk);
+            }
         }
 
+        /// <summary>
+        /// Представляет стакан цен (биржевой стакан) с методами анализа ликвидности
+        /// </summary>
         public class OrderBook
         {
-            public List<OrderBookEntry> Bids { get; set; } = new();
-            public List<OrderBookEntry> Asks { get; set; } = new();
+            /// <summary>
+            /// Идентификатор торговой пары (например, BTCUSDT)
+            /// </summary>
+            public string Symbol { get; set; }
+
+            /// <summary>
+            /// Список заявок на покупку (биды), отсортированный по цене от высокой к низкой
+            /// </summary>
+            public List<OrderBookEntry> Bids { get; set; } = new List<OrderBookEntry>();
+
+            /// <summary>
+            /// Список заявок на продажу (аски), отсортированный по цене от низкой к высокой
+            /// </summary>
+            public List<OrderBookEntry> Asks { get; set; } = new List<OrderBookEntry>();
+
+            /// <summary>
+            /// Время последнего обновления стакана
+            /// </summary>
             public DateTime Timestamp { get; set; }
 
-            public decimal CalculateLiquidity(decimal currentPrice)
+            /// <summary>
+            /// Рассчитывает общую ликвидность вокруг текущей цены
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <param name="percentRange">Процентный диапазон от текущей цены (по умолчанию ±2%)</param>
+            /// <returns>Суммарный объем ликвидности в USDT</returns>
+            public decimal CalculateLiquidity(decimal currentPrice, decimal percentRange = 2m)
             {
-                var minPrice = currentPrice * 0.98m;
-                var maxPrice = currentPrice * 1.02m;
+                if (currentPrice <= 0)
+                    return 0;
 
-                var bidLiquidity = Bids
-                    .Where(b => b.Price >= minPrice)
+                // Рассчитываем границы диапазона
+                decimal lowerBound = currentPrice * (1 - percentRange / 100);
+                decimal upperBound = currentPrice * (1 + percentRange / 100);
+
+                // Суммируем ликвидность бидов в диапазоне
+                decimal bidLiquidity = Bids
+                    .Where(b => b.Price >= lowerBound)
                     .Sum(b => b.Price * b.Quantity);
 
-                var askLiquidity = Asks
-                    .Where(a => a.Price <= maxPrice)
+                // Суммируем ликвидность асков в диапазоне
+                decimal askLiquidity = Asks
+                    .Where(a => a.Price <= upperBound)
                     .Sum(a => a.Price * a.Quantity);
 
                 return bidLiquidity + askLiquidity;
             }
+
+            /// <summary>
+            /// Рассчитывает имбаланс стакана - соотношение объема бидов к аскам
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <param name="depthLevels">Количество уровней стакана для анализа</param>
+            /// <returns>
+            /// Значение от -1 до 1: 
+            /// -1 - полное доминирование асков,
+            ///  0 - баланс,
+            /// +1 - полное доминирование бидов
+            /// </returns>
+            public decimal CalculateImbalance(decimal currentPrice, int depthLevels = 10)
+            {
+                if (Bids.Count == 0 || Asks.Count == 0 || currentPrice <= 0)
+                    return 0;
+
+                // Берем верхние N уровней стакана
+                var topBids = Bids.Take(depthLevels).ToList();
+                var topAsks = Asks.Take(depthLevels).ToList();
+
+                // Рассчитываем взвешенный объем
+                decimal bidVolume = topBids.Sum(b => b.Quantity * (1 - (currentPrice - b.Price) / currentPrice));
+                decimal askVolume = topAsks.Sum(a => a.Quantity * (1 - (a.Price - currentPrice) / currentPrice));
+
+                if (bidVolume + askVolume == 0)
+                    return 0;
+
+                return (bidVolume - askVolume) / (bidVolume + askVolume);
+            }
+
+            /// <summary>
+            /// Находит ключевые уровни поддержки и сопротивления в стакане
+            /// </summary>
+            /// <param name="levelsCount">Количество возвращаемых уровней</param>
+            /// <returns>
+            /// Кортеж где:
+            /// Item1 - список уровней поддержки (биды),
+            /// Item2 - список уровней сопротивления (аски)
+            /// </returns>
+            public (List<decimal> Supports, List<decimal> Resistances) FindKeyLevels(int levelsCount = 3)
+            {
+                // Группируем биды по ценам (округленным до 2 знаков) и находим крупнейшие скопления
+                var supportLevels = Bids
+                    .GroupBy(b => Math.Round(b.Price, 2))
+                    .OrderByDescending(g => g.Sum(b => b.Quantity))
+                    .Take(levelsCount)
+                    .Select(g => g.Key)
+                    .ToList();
+
+                // Аналогично для асков
+                var resistanceLevels = Asks
+                    .GroupBy(a => Math.Round(a.Price, 2))
+                    .OrderByDescending(g => g.Sum(a => a.Quantity))
+                    .Take(levelsCount)
+                    .Select(g => g.Key)
+                    .ToList();
+
+                return (supportLevels, resistanceLevels);
+            }
+
+            /// <summary>
+            /// Рассчитывает средневзвешенную цену (VWAP) для заданного объема
+            /// </summary>
+            /// <param name="quantity">Желаемый объем</param>
+            /// <param name="side">Направление (BUY/SELL)</param>
+            /// <returns>
+            /// Кортеж где:
+            /// Item1 - средневзвешенная цена,
+            /// Item2 - общий доступный объем
+            /// </returns>
+            public (decimal Vwap, decimal TotalQuantity) CalculateVwap(decimal quantity, OrderSide side)
+            {
+                var levels = side == OrderSide.Buy ? Asks : Bids;
+                decimal totalValue = 0;
+                decimal filledQuantity = 0;
+
+                foreach (var level in levels)
+                {
+                    if (filledQuantity >= quantity)
+                        break;
+
+                    decimal available = level.Quantity;
+                    decimal needed = quantity - filledQuantity;
+                    decimal executing = Math.Min(available, needed);
+
+                    totalValue += executing * level.Price;
+                    filledQuantity += executing;
+                }
+
+                if (filledQuantity == 0)
+                    return (0, 0);
+
+                return (totalValue / filledQuantity, filledQuantity);
+            }
+
+            /// <summary>
+            /// Определяет есть ли в стакане аномалии ликвидности
+            /// </summary>
+            /// <param name="currentPrice">Текущая рыночная цена</param>
+            /// <returns>
+            /// True если обнаружены:
+            /// - Большие "стены" в стакане
+            /// - Резкие перепады ликвидности
+            /// - Подозрительные кластеры ордеров
+            /// </returns>
+            public bool HasLiquidityAnomalies(decimal currentPrice)
+            {
+                if (Bids.Count == 0 || Asks.Count == 0)
+                    return false;
+
+                // Проверяем большие "стены" в стакане
+                decimal avgBidSize = Bids.Average(b => b.Quantity);
+                decimal maxBidSize = Bids.Max(b => b.Quantity);
+                bool hasBidWall = maxBidSize > avgBidSize * 10;
+
+                decimal avgAskSize = Asks.Average(a => a.Quantity);
+                decimal maxAskSize = Asks.Max(a => a.Quantity);
+                bool hasAskWall = maxAskSize > avgAskSize * 10;
+
+                // Проверяем резкие перепады ликвидности
+                var bidVolumes = Bids.Select(b => b.Quantity).ToList();
+                bool hasBidSpikes = CheckVolumeSpikes(bidVolumes);
+
+                var askVolumes = Asks.Select(a => a.Quantity).ToList();
+                bool hasAskSpikes = CheckVolumeSpikes(askVolumes);
+
+                return hasBidWall || hasAskWall || hasBidSpikes || hasAskSpikes;
+            }
+
+            private bool CheckVolumeSpikes(List<decimal> volumes)
+            {
+                if (volumes.Count < 5)
+                    return false;
+
+                decimal avg = volumes.Average();
+                decimal stdDev = (decimal)Math.Sqrt(volumes.Average(v => Math.Pow((double)(v - avg), 2)));
+
+                // Считаем аномалией объемы больше чем 3 стандартных отклонения
+                return volumes.Any(v => v > avg + 3 * stdDev);
+            }
+
+            /// <summary>
+            /// Обновляет стакан новыми данными
+            /// </summary>
+            /// <param name="newBids">Новые биды</param>
+            /// <param name="newAsks">Новые аски</param>
+            public void Update(List<OrderBookEntry> newBids, List<OrderBookEntry> newAsks)
+            {
+                // Сортируем биды по убыванию цены
+                Bids = newBids
+                    .OrderByDescending(b => b.Price)
+                    .ToList();
+
+                // Сортируем аски по возрастанию цены
+                Asks = newAsks
+                    .OrderBy(a => a.Price)
+                    .ToList();
+
+                Timestamp = DateTime.UtcNow;
+            }
+
+            /// <summary>
+            /// Возвращает разницу между лучшим бидом и аском (спред)
+            /// </summary>
+            public decimal GetSpread()
+            {
+                if (Bids.Count == 0 || Asks.Count == 0)
+                    return 0;
+
+                return Asks[0].Price - Bids[0].Price;
+            }
+
+            /// <summary>
+            /// Возвращает среднюю цену между лучшим бидом и аском (mid price)
+            /// </summary>
+            public decimal GetMidPrice()
+            {
+                if (Bids.Count == 0 || Asks.Count == 0)
+                    return 0;
+
+                return (Bids[0].Price + Asks[0].Price) / 2;
+            }
+
+            /// <summary>
+            /// Находит крупнейшие кластеры ликвидности в стакане
+            /// </summary>
+            /// <param name="side">Направление (BUY/SELL)</param>
+            /// <param name="clusterSize">Размер кластера в процентах от цены</param>
+            /// <returns>Список кластеров, отсортированный по объему</returns>
+            public List<LiquidityCluster> FindLiquidityClusters(OrderSide side, decimal clusterSize = 0.1m)
+            {
+                var levels = side == OrderSide.Buy ? Bids : Asks;
+                if (!levels.Any())
+                    return new List<LiquidityCluster>();
+
+                var clusters = new List<LiquidityCluster>();
+                var currentCluster = new LiquidityCluster
+                {
+                    MinPrice = levels[0].Price,
+                    MaxPrice = levels[0].Price,
+                    TotalQuantity = levels[0].Quantity
+                };
+
+                for (int i = 1; i < levels.Count; i++)
+                {
+                    decimal price = levels[i].Price;
+                    decimal priceDiff = Math.Abs(price - currentCluster.MinPrice) / currentCluster.MinPrice * 100;
+
+                    if (priceDiff <= clusterSize)
+                    {
+                        currentCluster.MinPrice = Math.Min(currentCluster.MinPrice, price);
+                        currentCluster.MaxPrice = Math.Max(currentCluster.MaxPrice, price);
+                        currentCluster.TotalQuantity += levels[i].Quantity;
+                    }
+                    else
+                    {
+                        clusters.Add(currentCluster);
+                        currentCluster = new LiquidityCluster
+                        {
+                            MinPrice = price,
+                            MaxPrice = price,
+                            TotalQuantity = levels[i].Quantity
+                        };
+                    }
+                }
+
+                clusters.Add(currentCluster);
+                return clusters
+                    .OrderByDescending(c => c.TotalQuantity)
+                    .ToList();
+            }
         }
 
+        /// <summary>
+        /// Представляет одну запись в стакане (ордер)
+        /// </summary>
         public class OrderBookEntry
         {
-            public decimal Price { get; set; }
-            public decimal Quantity { get; set; }
-
             public OrderBookEntry(decimal price, decimal quantity)
             {
                 Price = price;
                 Quantity = quantity;
             }
+
+            /// <summary>
+            /// Цена ордера
+            /// </summary>
+            public decimal Price { get; set; }
+
+            /// <summary>
+            /// Количество (объем) ордера
+            /// </summary>
+            public decimal Quantity { get; set; }
+
+            public override string ToString() => $"{Price} x {Quantity}";
         }
 
-        public class PricePrediction
+        /// <summary>
+        /// Представляет кластер ликвидности - группу ордеров в близком ценовом диапазоне
+        /// </summary>
+        public class LiquidityCluster
         {
-            [ColumnName("Score")]
-            public float FuturePriceChange { get; set; }
+            /// <summary>
+            /// Минимальная цена в кластере
+            /// </summary>
+            public decimal MinPrice { get; set; }
+
+            /// <summary>
+            /// Максимальная цена в кластере
+            /// </summary>
+            public decimal MaxPrice { get; set; }
+
+            /// <summary>
+            /// Суммарный объем кластера
+            /// </summary>
+            public decimal TotalQuantity { get; set; }
+
+            /// <summary>
+            /// Средняя цена кластера
+            /// </summary>
+            public decimal AveragePrice => (MinPrice + MaxPrice) / 2;
+
+            public override string ToString() =>
+                $"{AveragePrice} [{MinPrice}-{MaxPrice}] x {TotalQuantity}";
         }
 
-        public class BacktestResult
+        /// <summary>
+        /// Направление ордера (покупка/продажа)
+        /// </summary>
+        public enum OrderSide
         {
-            public bool Success { get; set; }
-            public decimal SharpeRatio { get; set; }
-            public decimal TotalReturn { get; set; }
-            public decimal MaxDrawdown { get; set; }
-            public decimal WinRate { get; set; }
-            public string TimeFrame { get; set; }
-            public List<TradeRecord> Trades { get; set; } = new();
-
-            // Новые метрики:
-            public decimal SortinoRatio { get; set; }
-            public decimal ProfitFactor { get; set; }
-            public decimal AvgTradeDuration { get; set; } // в минутах
-            public decimal WorstTrade { get; set; }
-            public decimal BestTrade { get; set; }
-            public decimal StabilityIndex { get; set; } // Стабильность доходности
+            Buy,
+            Sell
         }
 
+        /// <summary>
+        /// Полная запись о торговой операции с детализацией всех параметров
+        /// </summary>
         public class TradeRecord
         {
+            /// <summary>
+            /// Торговая пара (например, BTCUSDT)
+            /// </summary>
             public string Symbol { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Направление сделки (BUY/SELL)
+            /// </summary>
             public string Side { get; set; } = string.Empty;
+
+            /// <summary>
+            /// Объем актива в сделке (количество монет)
+            /// </summary>
             public decimal Quantity { get; set; }
+
+            /// <summary>
+            /// Цена входа в позицию
+            /// </summary>
             public decimal EntryPrice { get; set; }
+
+            /// <summary>
+            /// Цена выхода из позиции (null если позиция еще открыта)
+            /// </summary>
             public decimal? ExitPrice { get; set; }
+
+            /// <summary>
+            /// Прибыль/убыток по сделке в USDT (null если позиция еще открыта)
+            /// </summary>
             public decimal? Profit { get; set; }
-            public decimal Commission { get; set; }
+
+            /// <summary>
+            /// Время открытия позиции (UTC)
+            /// </summary>
             public DateTime EntryTime { get; set; }
+
+            /// <summary>
+            /// Время закрытия позиции (UTC, null если позиция еще открыта)
+            /// </summary>
             public DateTime? ExitTime { get; set; }
+
+            /// <summary>
+            /// Уровень стоп-лосса при открытии
+            /// </summary>
             public decimal StopLoss { get; set; }
+
+            /// <summary>
+            /// Уровень тейк-профита при открытии
+            /// </summary>
             public decimal TakeProfit { get; set; }
+
+            /// <summary>
+            /// Сумма комиссий по сделке
+            /// </summary>
+            public decimal Commission { get; set; }
+
+            /// <summary>
+            /// Флаг успешности сделки (true если Profit > 0)
+            /// </summary>
             public bool IsSuccessful { get; set; }
+
+            /// <summary>
+            /// Процент риска от депозита на сделку
+            /// </summary>
             public decimal RiskPercent { get; set; }
+
+            /// <summary>
+            /// Волатильность актива на момент входа
+            /// </summary>
             public decimal Volatility { get; set; }
+
+            /// <summary>
+            /// Уровень ликвидности на момент входа
+            /// </summary>
             public decimal Liquidity { get; set; }
+
+            /// <summary>
+            /// Величина проскальзывания при исполнении
+            /// </summary>
             public decimal Slippage { get; set; }
+
+            /// <summary>
+            /// Таймфрейм, на котором был сгенерирован сигнал
+            /// </summary>
             public string TimeFrame { get; set; }
+
+            /// <summary>
+            /// Причина закрытия позиции (если закрыта)
+            /// </summary>
             public string ExitReason { get; set; }
 
-            // Новые поля:
-            public string StrategyId { get; set; } // Для анализа стратегий
-            public decimal InitialRiskReward { get; set; } // Планируемое RR
-            public decimal RealizedRiskReward { get; set; } // Фактическое RR
-            public int ExecutionSeconds { get; set; } // Время исполнения
-        }
+            /// <summary>
+            /// Идентификатор стратегии, сгенерировавшей сигнал
+            /// </summary>
+            public string StrategyId { get; set; }
 
-        public class NewsEvent
-        {
-            public string Symbol { get; set; }
-            public string Title { get; set; }
+            /// <summary>
+            /// Планируемый риск-ривард при входе
+            /// </summary>
+            public decimal InitialRiskReward { get; set; }
 
-            // Расширенные поля:
-            public NewsSource Source { get; set; } // Источник новости
-            public string[] RelatedAssets { get; set; } // Связанные активы
-            public decimal SentimentScore { get; set; } // -1 до +1
-            public int ImpactLevel { get; set; } // 1-5
-            public DateTime PublishedAt { get; set; }
-            public DateTime ExpiresAt { get; set; }
+            /// <summary>
+            /// Фактический риск-ривард при выходе (null если позиция открыта)
+            /// </summary>
+            public decimal? RealizedRiskReward { get; set; }
 
-            // Новые поля:
-            public bool IsVerified { get; set; } // Подтвержденная новость
-            public string NewsId { get; set; } // Уникальный ID
-            public decimal MarketReaction { get; set; } // % изменения цены после новости
+            /// <summary>
+            /// Время исполнения ордера в секундах
+            /// </summary>
+            public int ExecutionSeconds { get; set; }
+
+            /// <summary>
+            /// Дополнительные метки сделки (теги, категории и т.д.)
+            /// </summary>
+            public List<string> Tags { get; set; } = new List<string>();
+
+            /// <summary>
+            /// Пользовательские заметки по сделке
+            /// </summary>
+            public string Notes { get; set; }
+
+            /// <summary>
+            /// Список связанных ордеров (хеджирующие позиции, частичные закрытия)
+            /// </summary>
+            public List<RelatedOrder> RelatedOrders { get; set; } = new List<RelatedOrder>();
+
+            /// <summary>
+            /// Рассчитывает ключевые метрики сделки при закрытии позиции
+            /// </summary>
+            public void CalculateMetricsOnClose()
+            {
+                if (ExitPrice.HasValue)
+                {
+                    // Расчет прибыли с учетом направления сделки
+                    Profit = (ExitPrice.Value - EntryPrice) * Quantity *
+                            (Side == "SELL" ? -1 : 1) - Commission;
+
+                    // Расчет фактического риск-риварда
+                    if (StopLoss != 0)
+                    {
+                        var risk = Math.Abs(EntryPrice - StopLoss);
+                        var reward = Math.Abs(ExitPrice.Value - EntryPrice);
+                        RealizedRiskReward = reward / risk;
+                    }
+
+                    // Определение успешности сделки
+                    IsSuccessful = Profit > 0;
+                }
+            }
+
+            /// <summary>
+            /// Добавляет связанный ордер (хедж, частичное закрытие и т.д.)
+            /// </summary>
+            public void AddRelatedOrder(string orderId, string type, decimal quantity, decimal price)
+            {
+                RelatedOrders.Add(new RelatedOrder
+                {
+                    OrderId = orderId,
+                    Type = type,
+                    Quantity = quantity,
+                    Price = price,
+                    Timestamp = DateTime.UtcNow
+                });
+            }
+
+            /// <summary>
+            /// Возвращает строковое представление сделки
+            /// </summary>
+            public override string ToString()
+            {
+                return $"{Symbol} {Side} {Quantity}@{EntryPrice} " +
+                       $"SL:{StopLoss} TP:{TakeProfit} " +
+                       $"PnL:{(Profit?.ToString("F2") ?? "open")} " +
+                       $"Strategy:{StrategyId}";
+            }
+
+            /// <summary>
+            /// Запись о связанном ордере
+            /// </summary>
+            public class RelatedOrder
+            {
+                public string OrderId { get; set; }
+                public string Type { get; set; } // "HEDGE", "PARTIAL_CLOSE" и т.д.
+                public decimal Quantity { get; set; }
+                public decimal Price { get; set; }
+                public DateTime Timestamp { get; set; }
+            }
         }
 
         public enum NewsSource
