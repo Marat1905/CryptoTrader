@@ -3061,82 +3061,110 @@ namespace AdvancedCryptoTradingBot
             }
         }
 
-
-
-
-
-
-
-
-
-        /// <summary></summary>
+        /// <summary>
+        /// Обработчик рыночных данных с поддержкой нескольких таймфреймов
+        /// </summary>
         public class MultiTimeFrameMarketDataProcessor
         {
+            // Кэш данных по таймфреймам
             private readonly Dictionary<KlineInterval, List<MarketDataPoint>> _dataCache = new();
+
+            // Объект для синхронизации доступа к кэшу
             private readonly object _cacheLock = new();
+
+            // Список поддерживаемых таймфреймов
             private readonly List<KlineInterval> _timeFrames;
+
+            // Кэш последних стаканов цен по символам
             private readonly Dictionary<string, OrderBook> _lastOrderBooks = new();
 
+            /// <summary>
+            /// Конструктор с инициализацией таймфреймов
+            /// </summary>
             public MultiTimeFrameMarketDataProcessor(List<KlineInterval> timeFrames)
             {
                 _timeFrames = timeFrames;
+
+                // Инициализация кэша для каждого таймфрейма
                 foreach (var tf in timeFrames)
                 {
                     _dataCache[tf] = new List<MarketDataPoint>();
                 }
             }
 
+            /// <summary>
+            /// Обработка новой свечи
+            /// </summary>
             public void ProcessKline(MarketDataPoint data)
             {
                 lock (_cacheLock)
                 {
+                    // Проверка поддержки таймфрейма
                     if (!_dataCache.ContainsKey(data.TimeFrame))
                         return;
 
+                    // Добавление данных в кэш
                     _dataCache[data.TimeFrame].Add(data);
 
+                    // Ограничение размера кэша (5000 последних свечей)
                     if (_dataCache[data.TimeFrame].Count > 5000)
                     {
-                        _dataCache[data.TimeFrame].RemoveRange(0, _dataCache[data.TimeFrame].Count - 5000);
+                        _dataCache[data.TimeFrame].RemoveRange(
+                            0,
+                            _dataCache[data.TimeFrame].Count - 5000);
                     }
                 }
 
+                // Расчет индикаторов для новой свечи
                 CalculateIndicators(data);
             }
 
+            /// <summary>
+            /// Обработка обновления стакана цен
+            /// </summary>
             public void ProcessOrderBook(OrderBook book)
             {
                 _lastOrderBooks[book.Symbol] = book;
             }
 
+            /// <summary>
+            /// Получение данных по конкретному таймфрейму
+            /// </summary>
             public List<MarketDataPoint> GetLatestData(KlineInterval timeFrame)
             {
                 lock (_cacheLock)
                 {
                     return _dataCache.TryGetValue(timeFrame, out var data) ?
-                        new List<MarketDataPoint>(data) :
+                        new List<MarketDataPoint>(data) : // Возвращаем копию для безопасности
                         new List<MarketDataPoint>();
                 }
             }
 
+            /// <summary>
+            /// Расчет технических индикаторов для свечи
+            /// </summary>
             public void CalculateIndicators(MarketDataPoint data)
             {
                 try
                 {
+                    // Получаем исторические данные для расчета индикаторов
                     var timeFrameData = GetLatestData(data.TimeFrame);
+
+                    // Для расчета большинства индикаторов нужно минимум 50 свечей
                     if (timeFrameData.Count < 50) return;
 
+                    // Подготовка массивов для TA-Lib
                     double[] closes = timeFrameData.Select(d => (double)d.Close).ToArray();
                     double[] highs = timeFrameData.Select(d => (double)d.High).ToArray();
                     double[] lows = timeFrameData.Select(d => (double)d.Low).ToArray();
                     double[] volumes = timeFrameData.Select(d => (double)d.Volume).ToArray();
 
-                    // RSI
+                    // 1. Расчет RSI (Relative Strength Index)
                     double[] rsiOutput = new double[closes.Length];
                     Core.Rsi(closes, 0, closes.Length - 1, rsiOutput, out _, out _);
                     data.RSI = (decimal)rsiOutput.Last();
 
-                    // MACD
+                    // 2. Расчет MACD (Moving Average Convergence Divergence)
                     double[] macd = new double[closes.Length];
                     double[] signal = new double[closes.Length];
                     double[] hist = new double[closes.Length];
@@ -3144,12 +3172,12 @@ namespace AdvancedCryptoTradingBot
                     data.MACD = (decimal)macd.Last();
                     data.Signal = (decimal)signal.Last();
 
-                    // ATR
+                    // 3. Расчет ATR (Average True Range)
                     double[] atrOutput = new double[closes.Length];
                     Core.Atr(highs, lows, closes, 0, closes.Length - 1, atrOutput, out _, out _);
                     data.ATR = (decimal)atrOutput.Last();
 
-                    // SMA
+                    // 4. Расчет SMA (Simple Moving Average)
                     double[] sma50 = new double[closes.Length];
                     Core.Sma(closes, 0, closes.Length - 1, sma50, out _, out _, 50);
                     data.SMA50 = (decimal)sma50.Last();
@@ -3158,15 +3186,15 @@ namespace AdvancedCryptoTradingBot
                     Core.Sma(closes, 0, closes.Length - 1, sma200, out _, out _, 200);
                     data.SMA200 = (decimal)sma200.Last();
 
-                    // OBV
+                    // 5. Расчет OBV (On-Balance Volume)
                     double[] obv = new double[closes.Length];
                     Core.Obv(closes, volumes, 0, closes.Length - 1, obv, out _, out _);
                     data.OBV = (decimal)obv.Last();
 
-                    // VWAP
+                    // 6. Расчет VWAP (Volume Weighted Average Price)
                     data.VWAP = CalculateVwap(timeFrameData);
 
-                    // Order Book Imbalance
+                    // 7. Расчет дисбаланса стакана
                     if (_lastOrderBooks.TryGetValue(data.Symbol, out var book))
                     {
                         data.OrderBookImbalance = CalculateOrderBookImbalance(book, data.Close);
@@ -3178,14 +3206,20 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Расчет VWAP (средневзвешенной цены по объему)
+            /// </summary>
             private decimal CalculateVwap(List<MarketDataPoint> data)
             {
                 try
                 {
-                    var period = data.TakeLast(30).ToList(); // 30 последних свечей
+                    // Берем последние 30 свечей для расчета
+                    var period = data.TakeLast(30).ToList();
                     decimal totalVolume = period.Sum(d => d.Volume);
+
                     if (totalVolume == 0) return 0;
 
+                    // Формула VWAP: сумма(цена * объем) / сумма(объем)
                     return period.Sum(d => d.Close * d.Volume) / totalVolume;
                 }
                 catch
@@ -3194,12 +3228,16 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Расчет дисбаланса стакана цен
+            /// </summary>
             private decimal CalculateOrderBookImbalance(OrderBook book, decimal currentPrice)
             {
                 try
                 {
+                    // Суммируем объемы в стакане рядом с текущей ценой
                     decimal bidVolume = book.Bids
-                        .Where(b => b.Price >= currentPrice * 0.99m)
+                        .Where(b => b.Price >= currentPrice * 0.99m) // ±1% от текущей цены
                         .Sum(b => b.Quantity);
 
                     decimal askVolume = book.Asks
@@ -3208,6 +3246,7 @@ namespace AdvancedCryptoTradingBot
 
                     if (bidVolume + askVolume == 0) return 0;
 
+                    // Формула дисбаланса: (объем бидов - объем асков) / (объем бидов + объем асков)
                     return (bidVolume - askVolume) / (bidVolume + askVolume);
                 }
                 catch
@@ -3216,41 +3255,59 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Генерация торгового сигнала на основе технических индикаторов
+            /// </summary>
             public TradingSignal GenerateTaSignal(MarketDataPoint data)
             {
                 try
                 {
+                    // Определение бычьего сигнала:
+                    // - RSI выше 50
+                    // - MACD выше сигнальной линии
+                    // - Цена выше SMA50
+                    // - SMA50 выше SMA200
+                    // - Дисбаланс стакана в сторону покупок
                     bool isBullish = data.RSI > 50m &&
                                     data.MACD > data.Signal &&
                                     data.Close > data.SMA50 &&
                                     data.SMA50 > data.SMA200 &&
                                     data.OrderBookImbalance > 0.2m;
 
+                    // Определение медвежьего сигнала:
+                    // - RSI ниже 50
+                    // - MACD ниже сигнальной линии
+                    // - Цена ниже SMA50
+                    // - SMA50 ниже SMA200  
+                    // - Дисбаланс стакана в сторону продаж
                     bool isBearish = data.RSI < 50m &&
                                      data.MACD < data.Signal &&
                                      data.Close < data.SMA50 &&
                                      data.SMA50 < data.SMA200 &&
                                      data.OrderBookImbalance < -0.2m;
 
+                    // Если нет четкого сигнала, используем RSI
                     var direction = isBullish ? TradeDirection.Long :
                                     isBearish ? TradeDirection.Short :
                                     data.RSI > 50m ? TradeDirection.Long : TradeDirection.Short;
 
+                    // Расчет уверенности сигнала на основе:
                     var confidenceFactors = new List<decimal>
                 {
-                    Math.Abs(data.RSI - 50m) / 50m,
-                    Math.Abs(data.MACD - data.Signal) / (data.Signal != 0 ? data.Signal : 1m),
-                    (data.Close - data.SMA50) / data.SMA50 * 10m,
-                    Math.Abs(data.OrderBookImbalance) * 2m
+                    Math.Abs(data.RSI - 50m) / 50m, // Отклонение RSI от 50
+                    Math.Abs(data.MACD - data.Signal) / (data.Signal != 0 ? data.Signal : 1m), // Расхождение MACD
+                    (data.Close - data.SMA50) / data.SMA50 * 10m, // Отклонение от SMA50
+                    Math.Abs(data.OrderBookImbalance) * 2m // Сила дисбаланса стакана
                 };
 
+                    // Усредняем факторы уверенности
                     var confidence = confidenceFactors.Average();
 
                     return new TradingSignal
                     {
                         Symbol = data.Symbol,
                         Direction = direction,
-                        Confidence = Math.Min(1m, confidence),
+                        Confidence = Math.Min(1m, confidence), // Ограничиваем 100%
                         Timestamp = DateTime.UtcNow,
                         TimeFrame = data.TimeFrame,
                         Features = new Dictionary<string, object>
@@ -3278,30 +3335,44 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Определение текущего рыночного тренда
+            /// </summary>
             public MarketTrend DetermineMarketTrend(List<MarketDataPoint> marketData)
             {
                 try
                 {
+                    // Используем дневные данные для определения тренда
                     var dailyData = marketData
                         .Where(d => d.TimeFrame == KlineInterval.OneDay)
                         .OrderBy(d => d.OpenTime)
                         .ToList();
 
+                    // Нужно минимум 30 дней данных
                     if (dailyData.Count < 30) return MarketTrend.Neutral;
 
+                    // Расчет скользящих средних
                     var sma50 = dailyData.TakeLast(50).Average(d => d.Close);
                     var sma200 = dailyData.TakeLast(200).Average(d => d.Close);
 
+                    // Анализ последних 5 дней
                     var last5Days = dailyData.TakeLast(5).ToList();
-                    var bullDays = last5Days.Count(d => d.Close > d.Open);
-                    var bearDays = last5Days.Count(d => d.Close < d.Open);
+                    var bullDays = last5Days.Count(d => d.Close > d.Open); // Дни с ростом
+                    var bearDays = last5Days.Count(d => d.Close < d.Open); // Дни с падением
 
+                    // Бычий тренд:
+                    // - SMA50 > SMA200
+                    // - Больше дней роста в последние 5 дней
                     if (sma50 > sma200 && bullDays > bearDays)
                         return MarketTrend.Bullish;
 
+                    // Медвежий тренд:
+                    // - SMA50 < SMA200  
+                    // - Больше дней падения в последние 5 дней
                     if (sma50 < sma200 && bearDays > bullDays)
                         return MarketTrend.Bearish;
 
+                    // Нейтральный тренд в остальных случаях
                     return MarketTrend.Neutral;
                 }
                 catch
@@ -3310,18 +3381,23 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Расчет исторической волатильности
+            /// </summary>
             public decimal CalculateVolatility(List<MarketDataPoint> data, int lookbackPeriod)
             {
                 if (data.Count < lookbackPeriod) return 0m;
 
                 try
                 {
+                    // Расчет дневных доходностей
                     var returns = new List<decimal>();
                     for (int i = 1; i < lookbackPeriod; i++)
                     {
                         returns.Add((data[i].Close - data[i - 1].Close) / data[i - 1].Close);
                     }
 
+                    // Стандартное отклонение доходностей
                     var mean = returns.Average();
                     var sumOfSquares = returns.Sum(r => Math.Pow((double)(r - mean), 2));
                     var stdDev = Math.Sqrt(sumOfSquares / returns.Count);
@@ -3334,6 +3410,9 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Получение последнего значения ATR
+            /// </summary>
             public decimal GetLatestAtr(KlineInterval timeFrame)
             {
                 lock (_cacheLock)
@@ -3343,20 +3422,24 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Анализ стакана цен
+            /// </summary>
             public OrderBookAnalysis AnalyzeOrderBook(OrderBook book)
             {
                 try
                 {
                     var analysis = new OrderBookAnalysis();
 
-                    // Уровни поддержки/сопротивления
+                    // Поиск уровней поддержки (3 самых объемных уровня бидов)
                     analysis.SupportLevels = book.Bids
-                        .GroupBy(b => Math.Round(b.Price, 2))
-                        .OrderByDescending(g => g.Sum(b => b.Quantity))
-                        .Take(3)
-                        .Select(g => g.Key)
+                        .GroupBy(b => Math.Round(b.Price, 2)) // Группируем по ценам с точностью до 0.01
+                        .OrderByDescending(g => g.Sum(b => b.Quantity)) // Сортируем по объему
+                        .Take(3) // Берем топ-3
+                        .Select(g => g.Key) // Берем только цены
                         .ToList();
 
+                    // Поиск уровней сопротивления (3 самых объемных уровня асков)
                     analysis.ResistanceLevels = book.Asks
                         .GroupBy(a => Math.Round(a.Price, 2))
                         .OrderByDescending(g => g.Sum(a => a.Quantity))
@@ -3364,7 +3447,7 @@ namespace AdvancedCryptoTradingBot
                         .Select(g => g.Key)
                         .ToList();
 
-                    // Кластеры ликвидности
+                    // Поиск кластеров ликвидности
                     analysis.BidClusters = FindLiquidityClusters(book.Bids);
                     analysis.AskClusters = FindLiquidityClusters(book.Asks);
 
@@ -3376,6 +3459,9 @@ namespace AdvancedCryptoTradingBot
                 }
             }
 
+            /// <summary>
+            /// Поиск кластеров ликвидности в стакане
+            /// </summary>
             private List<LiquidityCluster> FindLiquidityClusters(List<OrderBookEntry> entries)
             {
                 if (!entries.Any()) return new List<LiquidityCluster>();
@@ -3387,9 +3473,10 @@ namespace AdvancedCryptoTradingBot
                     MaxPrice = entries[0].Price
                 };
 
+                // Группируем близкие по цене уровни
                 foreach (var entry in entries)
                 {
-                    if (entry.Price <= currentCluster.MaxPrice * 1.001m)
+                    if (entry.Price <= currentCluster.MaxPrice * 1.001m) // ±0.1%
                     {
                         currentCluster.MaxPrice = entry.Price;
                         currentCluster.TotalQuantity += entry.Quantity;
@@ -3407,24 +3494,30 @@ namespace AdvancedCryptoTradingBot
                 }
 
                 clusters.Add(currentCluster);
+
+                // Возвращаем 3 самых больших кластера
                 return clusters
                     .OrderByDescending(c => c.TotalQuantity)
                     .Take(3)
                     .ToList();
             }
 
+            /// <summary>
+            /// Прогноз волатильности на основе исторических данных
+            /// </summary>
             public decimal ForecastVolatility(string symbol, int periods)
             {
                 try
                 {
+                    // Получаем часовые данные для символа
                     var data = GetLatestData(KlineInterval.OneHour)
                         .Where(d => d.Symbol == symbol)
-                        .TakeLast(100)
+                        .TakeLast(100) // Последние 100 часов
                         .ToList();
 
                     if (data.Count < 50) return 0m;
 
-                    // Простая модель на основе исторической волатильности
+                    // Усредняем волатильность за разные периоды (от 5 до 20 периодов)
                     decimal sum = 0;
                     int count = 0;
 
@@ -3443,20 +3536,35 @@ namespace AdvancedCryptoTradingBot
             }
         }
 
+        /// <summary>
+        /// Результат анализа стакана цен
+        /// </summary>
         public class OrderBookAnalysis
         {
-            public List<decimal> SupportLevels { get; set; } = new();
-            public List<decimal> ResistanceLevels { get; set; } = new();
-            public List<LiquidityCluster> BidClusters { get; set; } = new();
-            public List<LiquidityCluster> AskClusters { get; set; } = new();
+            public List<decimal> SupportLevels { get; set; } = new(); // Уровни поддержки
+            public List<decimal> ResistanceLevels { get; set; } = new(); // Уровни сопротивления
+            public List<LiquidityCluster> BidClusters { get; set; } = new(); // Кластеры ликвидности на покупку
+            public List<LiquidityCluster> AskClusters { get; set; } = new(); // Кластеры ликвидности на продажу
         }
 
+        /// <summary>
+        /// Кластер ликвидности (группа близких по цене уровней в стакане)
+        /// </summary>
         public class LiquidityCluster
         {
-            public decimal MinPrice { get; set; }
-            public decimal MaxPrice { get; set; }
-            public decimal TotalQuantity { get; set; }
+            public decimal MinPrice { get; set; } // Минимальная цена в кластере
+            public decimal MaxPrice { get; set; } // Максимальная цена в кластере
+            public decimal TotalQuantity { get; set; } // Суммарный объем кластера
         }
+
+
+
+
+
+
+
+
+
 
         public class PortfolioManager
         {
