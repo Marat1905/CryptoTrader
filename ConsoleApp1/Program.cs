@@ -1,15 +1,10 @@
-﻿using Binance.Net;
-using Binance.Net.Clients;
+﻿using Binance.Net.Clients;
 using Binance.Net.Enums;
-using Binance.Net.Interfaces;
 using Binance.Net.Interfaces.Clients;
-using Binance.Net.Objects;
 using Binance.Net.Objects.Models.Spot;
 using Binance.Net.Objects.Models.Spot.Socket;
-using Binance.Net.Objects.Spot.SpotData;
 using CryptoExchange.Net.Authentication;
 using CryptoExchange.Net.Objects;
-using CryptoExchange.Net.Sockets;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Microsoft.ML;
@@ -17,17 +12,10 @@ using Microsoft.ML.Data;
 using Newtonsoft.Json;
 using Polly;
 using Polly.Retry;
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using TALib;
 using Telegram.Bot;
-using TicTacTec.TA.Library;
 
 namespace AdvancedCryptoTradingBot
 {
