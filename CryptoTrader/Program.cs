@@ -1,13 +1,15 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-using Binance.Net.Clients;
+﻿using Binance.Net.Clients;
 using Binance.Net.Enums;
 using Binance.Net.Interfaces;
+using Binance.Net.Objects.Models.Futures;
+using Binance.Net.Objects.Models.Spot;
 using CryptoExchange.Net.Authentication;
 using Microsoft.Extensions.Logging;
 using Microsoft.ML;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using Telegram.Bot;
 
 public class Program
@@ -19,7 +21,10 @@ public class Program
         public string TelegramToken { get; set; } = "6299377057:AAHaNlY93hdrdQVanTPgmMibgQt41UDidRA";
         public string TelegramChatId { get; set; } = "1314937104";
         public string Symbol { get; set; } = "BTCUSDT";
-        public decimal RiskPerTrade { get; set; } = 0.02m;
+        public decimal RiskPerTrade { get; set; } = 0.02m; // 2% риска на сделку
+        public decimal StopLossPercent { get; set; } = 0.05m; // 5% стоп-лосс
+        public decimal MaxDailyLossPercent { get; set; } = 0.10m; // 10% макс. убыток за день
+        public decimal TakeProfitPercent { get; set; } = 0.10m; // 10% тейк-профит
 
         // Параметры для оптимизации
         public int[] FastMAPeriodRange { get; set; } = new[] { 5, 15 };
@@ -63,6 +68,8 @@ public class Program
         decimal Quantity,
         decimal EntryPrice,
         decimal ExitPrice,
+        decimal StopLossPrice,
+        decimal TakeProfitPrice,
         decimal PnL)
     {
         public bool IsClosed => ExitPrice != 0;
@@ -82,6 +89,8 @@ public class Program
 
     private static BotConfig config = new BotConfig();
     private static ILogger logger;
+    private static decimal dailyPnL = 0;
+    private static DateTime lastTradeDate = DateTime.MinValue;
 
     public static async Task Main(string[] args)
     {
@@ -104,7 +113,7 @@ public class Program
         if (config.BacktestMode)
         {
             logger.LogInformation("=== БАКТЕСТ С ПАРАМЕТРАМИ ПО УМОЛЧАНИЮ ===");
-            await RunBacktest(binanceClient, telegramBot,"с параметрами по умолчанию", new TradingParams(
+            await RunBacktest(binanceClient, telegramBot, "с параметрами по умолчанию", new TradingParams(
                 config.FastMAPeriod,
                 config.SlowMAPeriod,
                 config.RSIPeriod,
@@ -120,7 +129,7 @@ public class Program
         if (config.BacktestMode)
         {
             logger.LogInformation("=== БАКТЕСТ С ОПТИМИЗИРОВАННЫМИ ПАРАМЕТРАМИ ===");
-            await RunBacktest(binanceClient, telegramBot,"c оптимизированными параметрами");
+            await RunBacktest(binanceClient, telegramBot, "c оптимизированными параметрами");
         }
         else
         {
@@ -259,6 +268,8 @@ public class Program
         decimal balance = config.InitialBalance;
         decimal position = 0;
         decimal entryPrice = 0;
+        decimal stopLossPrice = 0;
+        decimal takeProfitPrice = 0;
         var equityCurve = new List<decimal>();
 
         for (int i = Math.Max(parameters.SlowMAPeriod, parameters.RSIPeriod); i < allKlines.Count; i++)
@@ -270,6 +281,43 @@ public class Program
             var slowMa = CalculateSma(previousKlines, parameters.SlowMAPeriod);
             var rsi = CalculateRsi(previousKlines, parameters.RSIPeriod);
             var currentPrice = (double)currentKline.ClosePrice;
+
+            // Проверка стоп-лосса и тейк-профита
+            if (position != 0)
+            {
+                if (position > 0 && (decimal)currentPrice <= stopLossPrice)
+                {
+                    var pnl = position * (stopLossPrice - entryPrice);
+                    balance += pnl;
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+                else if (position > 0 && (decimal)currentPrice >= takeProfitPrice)
+                {
+                    var pnl = position * (takeProfitPrice - entryPrice);
+                    balance += pnl;
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+                else if (position < 0 && (decimal)currentPrice >= stopLossPrice)
+                {
+                    var pnl = position * (entryPrice - stopLossPrice);
+                    balance += pnl;
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+                else if (position < 0 && (decimal)currentPrice <= takeProfitPrice)
+                {
+                    var pnl = position * (entryPrice - takeProfitPrice);
+                    balance += pnl;
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+            }
 
             bool isBullish = fastMa > slowMa && previousKlines[^2] <= slowMa && rsi < parameters.OverboughtLevel;
             bool isBearish = fastMa < slowMa && previousKlines[^2] >= slowMa && rsi > parameters.OversoldLevel;
@@ -285,6 +333,8 @@ public class Program
                 decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
                 position = quantity;
                 entryPrice = (decimal)currentPrice;
+                stopLossPrice = entryPrice * (1 - config.StopLossPercent);
+                takeProfitPrice = entryPrice * (1 + config.TakeProfitPercent);
             }
             else if (isBearish && position >= 0)
             {
@@ -297,6 +347,8 @@ public class Program
                 decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
                 position = -quantity;
                 entryPrice = (decimal)currentPrice;
+                stopLossPrice = entryPrice * (1 + config.StopLossPercent);
+                takeProfitPrice = entryPrice * (1 - config.TakeProfitPercent);
             }
 
             equityCurve.Add(balance + position * ((decimal)currentPrice - entryPrice));
@@ -385,6 +437,8 @@ public class Program
         decimal balance = config.InitialBalance;
         decimal position = 0;
         decimal entryPrice = 0;
+        decimal stopLossPrice = 0;
+        decimal takeProfitPrice = 0;
         var tradeHistory = new List<TradeRecord>();
         var equityCurve = new List<decimal>();
 
@@ -398,19 +452,78 @@ public class Program
             var rsi = CalculateRsi(previousKlines, parameters.RSIPeriod);
             var currentPrice = (double)currentKline.ClosePrice;
 
-            //if (i % 100 == 0)
-            //{
-            //    logger.LogInformation(
-            //        "{Time} | Цена: {Price} | MA{fastPeriod}: {FastMA} | MA{slowPeriod}: {SlowMA} | RSI: {RSI} | Баланс: {Balance}",
-            //        currentKline.OpenTime.ToString("yyyy-MM-dd HH:mm:ss"),
-            //        currentPrice.ToString("F2"),
-            //        parameters.FastMAPeriod,
-            //        fastMa.ToString("F2"),
-            //        parameters.SlowMAPeriod,
-            //        slowMa.ToString("F2"),
-            //        rsi.ToString("F2"),
-            //        balance.ToString("F2"));
-            //}
+            // Проверка стоп-лосса и тейк-профита
+            if (position != 0)
+            {
+                if (position > 0 && (decimal)currentPrice <= stopLossPrice)
+                {
+                    var pnl = position * (stopLossPrice - entryPrice);
+                    balance += pnl;
+                    tradeHistory.Add(new TradeRecord(
+                        currentKline.OpenTime,
+                        "SELL (SL)",
+                        position,
+                        entryPrice,
+                        stopLossPrice,
+                        stopLossPrice,
+                        takeProfitPrice,
+                        pnl));
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+                else if (position > 0 && (decimal)currentPrice >= takeProfitPrice)
+                {
+                    var pnl = position * (takeProfitPrice - entryPrice);
+                    balance += pnl;
+                    tradeHistory.Add(new TradeRecord(
+                        currentKline.OpenTime,
+                        "SELL (TP)",
+                        position,
+                        entryPrice,
+                        takeProfitPrice,
+                        stopLossPrice,
+                        takeProfitPrice,
+                        pnl));
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+                else if (position < 0 && (decimal)currentPrice >= stopLossPrice)
+                {
+                    var pnl = position * (entryPrice - stopLossPrice);
+                    balance += pnl;
+                    tradeHistory.Add(new TradeRecord(
+                        currentKline.OpenTime,
+                        "BUY (SL)",
+                        Math.Abs(position),
+                        entryPrice,
+                        stopLossPrice,
+                        stopLossPrice,
+                        takeProfitPrice,
+                        pnl));
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+                else if (position < 0 && (decimal)currentPrice <= takeProfitPrice)
+                {
+                    var pnl = position * (entryPrice - takeProfitPrice);
+                    balance += pnl;
+                    tradeHistory.Add(new TradeRecord(
+                        currentKline.OpenTime,
+                        "BUY (TP)",
+                        Math.Abs(position),
+                        entryPrice,
+                        takeProfitPrice,
+                        stopLossPrice,
+                        takeProfitPrice,
+                        pnl));
+                    position = 0;
+                    equityCurve.Add(balance);
+                    continue;
+                }
+            }
 
             bool isBullish = fastMa > slowMa && previousKlines[^2] <= slowMa && rsi < parameters.OverboughtLevel;
             bool isBearish = fastMa < slowMa && previousKlines[^2] >= slowMa && rsi > parameters.OversoldLevel;
@@ -422,17 +535,21 @@ public class Program
                     var pnl = position * ((decimal)currentPrice - entryPrice);
                     balance += pnl;
                     tradeHistory.Add(new TradeRecord(
-                        allKlines[i - 1].OpenTime,
-                        "SELL",
+                        currentKline.OpenTime,
+                        "BUY",
                         Math.Abs(position),
                         entryPrice,
                         (decimal)currentPrice,
+                        stopLossPrice,
+                        takeProfitPrice,
                         pnl));
                 }
 
                 decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
                 position = quantity;
                 entryPrice = (decimal)currentPrice;
+                stopLossPrice = entryPrice * (1 - config.StopLossPercent);
+                takeProfitPrice = entryPrice * (1 + config.TakeProfitPercent);
 
                 tradeHistory.Add(new TradeRecord(
                     currentKline.OpenTime,
@@ -440,6 +557,8 @@ public class Program
                     quantity,
                     entryPrice,
                     0,
+                    stopLossPrice,
+                    takeProfitPrice,
                     0));
             }
             else if (isBearish && position >= 0)
@@ -449,17 +568,21 @@ public class Program
                     var pnl = position * ((decimal)currentPrice - entryPrice);
                     balance += pnl;
                     tradeHistory.Add(new TradeRecord(
-                        allKlines[i - 1].OpenTime,
+                        currentKline.OpenTime,
                         "SELL",
                         position,
                         entryPrice,
                         (decimal)currentPrice,
+                        stopLossPrice,
+                        takeProfitPrice,
                         pnl));
                 }
 
                 decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
                 position = -quantity;
                 entryPrice = (decimal)currentPrice;
+                stopLossPrice = entryPrice * (1 + config.StopLossPercent);
+                takeProfitPrice = entryPrice * (1 - config.TakeProfitPercent);
 
                 tradeHistory.Add(new TradeRecord(
                     currentKline.OpenTime,
@@ -467,6 +590,8 @@ public class Program
                     quantity,
                     entryPrice,
                     0,
+                    stopLossPrice,
+                    takeProfitPrice,
                     0));
             }
 
@@ -485,6 +610,8 @@ public class Program
                 Math.Abs(position),
                 entryPrice,
                 (decimal)lastPrice,
+                stopLossPrice,
+                takeProfitPrice,
                 pnl));
         }
 
@@ -554,6 +681,19 @@ public class Program
 
     private static async Task CheckMarketAndTradeAsync(BinanceRestClient binanceClient, TelegramBotClient telegramBot)
     {
+        // Проверяем дневной убыток
+        if (DateTime.Now.Date != lastTradeDate.Date)
+        {
+            dailyPnL = 0;
+            lastTradeDate = DateTime.Now.Date;
+        }
+
+        if (dailyPnL <= -config.InitialBalance * config.MaxDailyLossPercent)
+        {
+            logger.LogWarning("Достигнут дневной лимит убытков. Торговля приостановлена до следующего дня.");
+            return;
+        }
+
         var klinesResult = await binanceClient.SpotApi.ExchangeData.GetKlinesAsync(
             config.Symbol,
             KlineInterval.OneHour,
@@ -604,6 +744,19 @@ public class Program
 
     private static async Task ExecuteTradeAsync(BinanceRestClient binanceClient, TelegramBotClient telegramBot, OrderSide side, decimal currentPrice)
     {
+        // Проверяем дневной лимит убытков
+        if (DateTime.Now.Date != lastTradeDate.Date)
+        {
+            dailyPnL = 0;
+            lastTradeDate = DateTime.Now.Date;
+        }
+
+        if (dailyPnL <= -config.InitialBalance * config.MaxDailyLossPercent)
+        {
+            logger.LogWarning("Достигнут дневной лимит убытков. Торговля приостановлена до следующего дня.");
+            return;
+        }
+
         var accountInfo = await binanceClient.SpotApi.Account.GetAccountInfoAsync();
         if (!accountInfo.Success)
         {
@@ -618,9 +771,27 @@ public class Program
             return;
         }
 
+        // Проверяем открытые ордера
+        var openOrders = await binanceClient.SpotApi.Trading.GetOpenOrdersAsync(config.Symbol);
+        if (openOrders.Success && openOrders.Data.Any())
+        {
+            logger.LogInformation("Есть открытые ордера, пропускаем новую сделку");
+            return;
+        }
+
+        // Проверяем открытые позиции
+        var positions = await GetOpenPositions(binanceClient);
+        if (positions.Any())
+        {
+            logger.LogInformation("Есть открытые позиции, пропускаем новую сделку");
+            return;
+        }
+
+        // Рассчитываем размер позиции с учетом риска
         decimal quantity = (usdtBalance.Value * config.RiskPerTrade) / currentPrice;
         quantity = Math.Round(quantity, 6);
 
+        // Размещаем ордер
         var order = await binanceClient.SpotApi.Trading.PlaceOrderAsync(
             config.Symbol,
             side,
@@ -634,6 +805,25 @@ public class Program
             await telegramBot.SendMessage(
                 chatId: config.TelegramChatId,
                 text: message);
+
+            // Устанавливаем уровни стоп-лосса и тейк-профита
+            decimal stopLossPrice = side == OrderSide.Buy
+                ? currentPrice * (1 - config.StopLossPercent)
+                : currentPrice * (1 + config.StopLossPercent);
+
+            decimal takeProfitPrice = side == OrderSide.Buy
+                ? currentPrice * (1 + config.TakeProfitPercent)
+                : currentPrice * (1 - config.TakeProfitPercent);
+
+            logger.LogInformation("Стоп-лосс: {0}, Тейк-профит: {1}",
+                stopLossPrice.ToString("0.00"),
+                takeProfitPrice.ToString("0.00"));
+
+            // Для реальной торговли нужно создать OCO-ордер или отслеживать цену
+            if (!config.BacktestMode)
+            {
+                // Здесь можно разместить лимитные ордера или начать отслеживание цены
+            }
         }
         else
         {
@@ -642,6 +832,64 @@ public class Program
                 chatId: config.TelegramChatId,
                 text: $"❌ Ошибка: {order.Error}");
         }
+    }
+
+    private static async Task<List<BinancePosition>> GetOpenPositions(BinanceRestClient client)
+    {
+        var result = new List<BinancePosition>();
+
+        // Для Spot-торговли проверяем балансы
+        var accountInfo = await client.SpotApi.Account.GetAccountInfoAsync();
+        if (!accountInfo.Success) return result;
+
+        // Получаем текущую цену для символа
+        var ticker = await client.SpotApi.ExchangeData.GetPriceAsync(config.Symbol);
+        if (!ticker.Success) return result;
+
+        // Проверяем балансы по базовому и котируемому активам
+        var symbolParts = config.Symbol.ToUpper().Split("USDT");
+        var baseAsset = symbolParts[0];
+
+        var baseBalance = accountInfo.Data.Balances.FirstOrDefault(b => b.Asset == baseAsset)?.Total;
+        var quoteBalance = accountInfo.Data.Balances.FirstOrDefault(b => b.Asset == "USDT")?.Total;
+
+        if (baseBalance > 0)
+        {
+            result.Add(new BinancePosition
+            {
+                Symbol = config.Symbol,
+                PositionAmount = baseBalance.Value,
+                EntryPrice = 0, // Для Spot это сложно определить
+                MarkPrice = ticker.Data.Price,
+                Side = PositionSide.Long
+            });
+        }
+
+        return result;
+    }
+
+    private static async Task<List<BinancePosition>> GetFuturesPositions(BinanceRestClient client)
+    {
+        var result = new List<BinancePosition>();
+
+        var positions = await client.UsdFuturesApi.Account.GetPositionInformationAsync();
+        if (!positions.Success) return result;
+
+        foreach (var pos in positions.Data.Where(p => p.Quantity != 0))
+        {
+            result.Add(new BinancePosition
+            {
+                Symbol = pos.Symbol,
+                PositionAmount = pos.Quantity,
+                EntryPrice = pos.EntryPrice,
+                MarkPrice = pos.MarkPrice,
+                UnrealizedPnl = pos.UnrealizedPnl,
+                Side = pos.PositionSide == Binance.Net.Enums.PositionSide.Long ?
+                    PositionSide.Long : PositionSide.Short
+            });
+        }
+
+        return result;
     }
 
     private static double CalculateSma(double[] closes, int period)
@@ -664,5 +912,23 @@ public class Program
         if (losses == 0) return 100;
         double rs = gains / losses;
         return 100 - (100 / (1 + rs));
+    }
+
+
+
+    public class BinancePosition
+    {
+        public string Symbol { get; set; }
+        public decimal PositionAmount { get; set; }
+        public decimal EntryPrice { get; set; }
+        public decimal MarkPrice { get; set; }
+        public decimal UnrealizedPnl { get; set; }
+        public PositionSide Side { get; set; }
+    }
+
+    public enum PositionSide
+    {
+        Long,
+        Short
     }
 }
