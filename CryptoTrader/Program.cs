@@ -33,6 +33,17 @@ public class Program
         public double[] OverboughtLevelRange { get; set; } = new[] { 60.0, 80.0 };
         public double[] OversoldLevelRange { get; set; } = new[] { 20.0, 40.0 };
 
+        // Фильтры по объему и волатильности
+        public decimal MinVolumeUSDT { get; set; } = 1000000m; // Минимальный объем для торговли (1M USDT)
+        public decimal VolumeChangeThreshold { get; set; } = 0.5m; // 50% изменение объема
+        public decimal VolatilityThreshold { get; set; } = 0.02m; // 2% волатильность
+        public int VolatilityPeriod { get; set; } = 14; // Период для расчета волатильности
+
+        // Мультитаймфреймовый анализ
+        public KlineInterval PrimaryTimeframe { get; set; } = KlineInterval.OneHour;
+        public KlineInterval HigherTimeframe { get; set; } = KlineInterval.FourHour;
+        public KlineInterval LowerTimeframe { get; set; } = KlineInterval.FifteenMinutes;
+
         // Параметры по умолчанию
         public int FastMAPeriod { get; set; } = 9;
         public int SlowMAPeriod { get; set; } = 21;
@@ -275,11 +286,19 @@ public class Program
         for (int i = Math.Max(parameters.SlowMAPeriod, parameters.RSIPeriod); i < allKlines.Count; i++)
         {
             var currentKline = allKlines[i];
-            var previousKlines = allKlines.Take(i).Select(k => (double)k.ClosePrice).ToArray();
+            var previousKlines = allKlines.Take(i).ToList();
 
-            var fastMa = CalculateSma(previousKlines, parameters.FastMAPeriod);
-            var slowMa = CalculateSma(previousKlines, parameters.SlowMAPeriod);
-            var rsi = CalculateRsi(previousKlines, parameters.RSIPeriod);
+            // Проверка объема
+            if (!CheckVolumeFilter(previousKlines, i)) continue;
+
+            // Проверка волатильности
+            if (!CheckVolatilityFilter(previousKlines, i)) continue;
+
+            var closePrices = previousKlines.Select(k => (double)k.ClosePrice).ToArray();
+
+            var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
+            var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
+            var rsi = CalculateRsi(closePrices, parameters.RSIPeriod);
             var currentPrice = (double)currentKline.ClosePrice;
 
             // Проверка стоп-лосса и тейк-профита
@@ -319,8 +338,8 @@ public class Program
                 }
             }
 
-            bool isBullish = fastMa > slowMa && previousKlines[^2] <= slowMa && rsi < parameters.OverboughtLevel;
-            bool isBearish = fastMa < slowMa && previousKlines[^2] >= slowMa && rsi > parameters.OversoldLevel;
+            bool isBullish = fastMa > slowMa && closePrices[^2] <= slowMa && rsi < parameters.OverboughtLevel;
+            bool isBearish = fastMa < slowMa && closePrices[^2] >= slowMa && rsi > parameters.OversoldLevel;
 
             if (isBullish && position <= 0)
             {
@@ -365,6 +384,59 @@ public class Program
         double sharpeRatio = CalculateSharpeRatio(equityCurve);
 
         return profitRatio * 0.7 + sharpeRatio * 0.3;
+    }
+
+    private static bool CheckVolumeFilter(List<IBinanceKline> klines, int currentIndex)
+    {
+        if (currentIndex < 2) return true;
+
+        var currentVolume = klines[currentIndex].Volume;
+        var prevVolume = klines[currentIndex - 1].Volume;
+
+        // Абсолютный объем
+        if (currentVolume * klines[currentIndex].ClosePrice < config.MinVolumeUSDT)
+            return false;
+
+        // Изменение объема
+        if (prevVolume == 0) return true;
+        var volumeChange = Math.Abs((currentVolume - prevVolume) / prevVolume);
+
+        return volumeChange >= config.VolumeChangeThreshold;
+    }
+
+    private static bool CheckVolatilityFilter(List<IBinanceKline> klines, int currentIndex)
+    {
+        if (currentIndex < config.VolatilityPeriod) return true;
+
+        var relevantKlines = klines.Skip(currentIndex - config.VolatilityPeriod).Take(config.VolatilityPeriod).ToList();
+        var prices = relevantKlines.Select(k => (double)k.ClosePrice).ToArray();
+        var atr = CalculateATR(relevantKlines, config.VolatilityPeriod);
+
+        // Рассчитываем волатильность как процентное изменение ATR от цены
+        var currentPrice = klines[currentIndex].ClosePrice;
+        var volatility = atr / currentPrice;
+
+        return volatility >= config.VolatilityThreshold;
+    }
+
+    private static decimal CalculateATR(List<IBinanceKline> klines, int period)
+    {
+        var trueRanges = new List<double>();
+
+        for (int i = 1; i < klines.Count; i++)
+        {
+            var current = klines[i];
+            var previous = klines[i - 1];
+
+            double highLow = (double)(current.HighPrice - current.LowPrice);
+            double highClose = Math.Abs((double)(current.HighPrice - previous.ClosePrice));
+            double lowClose = Math.Abs((double)(current.LowPrice - previous.ClosePrice));
+
+            trueRanges.Add(Math.Max(highLow, Math.Max(highClose, lowClose)));
+        }
+
+        if (trueRanges.Count < period) return 0;
+        return (decimal)trueRanges.TakeLast(period).Average();
     }
 
     private static double CalculateSharpeRatio(List<decimal> equityCurve)
@@ -445,11 +517,19 @@ public class Program
         for (int i = Math.Max(parameters.SlowMAPeriod, parameters.RSIPeriod); i < allKlines.Count; i++)
         {
             var currentKline = allKlines[i];
-            var previousKlines = allKlines.Take(i).Select(k => (double)k.ClosePrice).ToArray();
+            var previousKlines = allKlines.Take(i).ToList();
 
-            var fastMa = CalculateSma(previousKlines, parameters.FastMAPeriod);
-            var slowMa = CalculateSma(previousKlines, parameters.SlowMAPeriod);
-            var rsi = CalculateRsi(previousKlines, parameters.RSIPeriod);
+            // Проверка объема
+            if (!CheckVolumeFilter(previousKlines, i)) continue;
+
+            // Проверка волатильности
+            if (!CheckVolatilityFilter(previousKlines, i)) continue;
+
+            var closePrices = previousKlines.Select(k => (double)k.ClosePrice).ToArray();
+
+            var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
+            var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
+            var rsi = CalculateRsi(closePrices, parameters.RSIPeriod);
             var currentPrice = (double)currentKline.ClosePrice;
 
             // Проверка стоп-лосса и тейк-профита
@@ -525,8 +605,8 @@ public class Program
                 }
             }
 
-            bool isBullish = fastMa > slowMa && previousKlines[^2] <= slowMa && rsi < parameters.OverboughtLevel;
-            bool isBearish = fastMa < slowMa && previousKlines[^2] >= slowMa && rsi > parameters.OversoldLevel;
+            bool isBullish = fastMa > slowMa && closePrices[^2] <= slowMa && rsi < parameters.OverboughtLevel;
+            bool isBearish = fastMa < slowMa && closePrices[^2] >= slowMa && rsi > parameters.OversoldLevel;
 
             if (isBullish && position <= 0)
             {
@@ -694,22 +774,46 @@ public class Program
             return;
         }
 
-        var klinesResult = await binanceClient.SpotApi.ExchangeData.GetKlinesAsync(
-            config.Symbol,
-            KlineInterval.OneHour,
-            limit: Math.Max(config.SlowMAPeriod, config.RSIPeriod) + 50);
+        // Получаем данные с разных таймфреймов
+        var primaryKlines = await GetKlinesForTimeframe(binanceClient, config.PrimaryTimeframe);
+        var higherKlines = await GetKlinesForTimeframe(binanceClient, config.HigherTimeframe);
+        var lowerKlines = await GetKlinesForTimeframe(binanceClient, config.LowerTimeframe);
 
-        if (!klinesResult.Success)
+        if (primaryKlines == null || higherKlines == null || lowerKlines == null)
         {
-            logger.LogError("Ошибка получения свечей: {Error}", klinesResult.Error);
+            logger.LogError("Не удалось получить данные с одного из таймфреймов");
             return;
         }
 
-        var closes = klinesResult.Data.Select(k => (double)k.ClosePrice).ToArray();
+        // Проверяем объем и волатильность
+        if (!CheckLiveVolumeFilter(primaryKlines))
+        {
+            logger.LogInformation("Фильтр объема не пройден");
+            return;
+        }
 
-        var fastMa = CalculateSma(closes, config.FastMAPeriod);
-        var slowMa = CalculateSma(closes, config.SlowMAPeriod);
-        var rsi = CalculateRsi(closes, config.RSIPeriod);
+        if (!CheckLiveVolatilityFilter(primaryKlines))
+        {
+            logger.LogInformation("Фильтр волатильности не пройден");
+            return;
+        }
+
+        // Анализ на основном таймфрейме
+        var primaryCloses = primaryKlines.Select(k => (double)k.ClosePrice).ToArray();
+        var primaryFastMa = CalculateSma(primaryCloses, config.FastMAPeriod);
+        var primarySlowMa = CalculateSma(primaryCloses, config.SlowMAPeriod);
+        var primaryRsi = CalculateRsi(primaryCloses, config.RSIPeriod);
+
+        // Анализ на старшем таймфрейме (тренд)
+        var higherCloses = higherKlines.Select(k => (double)k.ClosePrice).ToArray();
+        var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod);
+        var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod);
+
+        // Анализ на младшем таймфрейме (точки входа)
+        var lowerCloses = lowerKlines.Select(k => (double)k.ClosePrice).ToArray();
+        var lowerFastMa = CalculateSma(lowerCloses, config.FastMAPeriod / 2); // Уменьшаем период для младшего ТФ
+        var lowerSlowMa = CalculateSma(lowerCloses, config.SlowMAPeriod / 2);
+        var lowerRsi = CalculateRsi(lowerCloses, config.RSIPeriod / 2);
 
         var ticker = await binanceClient.SpotApi.ExchangeData.GetPriceAsync(config.Symbol);
         if (!ticker.Success)
@@ -724,13 +828,26 @@ public class Program
             DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
             currentPrice.ToString("F2"),
             config.FastMAPeriod,
-            fastMa.ToString("F2"),
+            primaryFastMa.ToString("F2"),
             config.SlowMAPeriod,
-            slowMa.ToString("F2"),
-            rsi.ToString("F2"));
+            primarySlowMa.ToString("F2"),
+            primaryRsi.ToString("F2"));
 
-        bool isBullish = fastMa > slowMa && closes[^2] <= slowMa && rsi < config.OverboughtLevel;
-        bool isBearish = fastMa < slowMa && closes[^2] >= slowMa && rsi > config.OversoldLevel;
+        // Определяем тренд на старшем таймфрейме
+        bool isHigherTrendBullish = higherFastMa > higherSlowMa;
+        bool isHigherTrendBearish = higherFastMa < higherSlowMa;
+
+        // Сигналы на основном таймфрейме
+        bool isPrimaryBullish = primaryFastMa > primarySlowMa && primaryCloses[^2] <= primarySlowMa && primaryRsi < config.OverboughtLevel;
+        bool isPrimaryBearish = primaryFastMa < primarySlowMa && primaryCloses[^2] >= primarySlowMa && primaryRsi > config.OversoldLevel;
+
+        // Сигналы на младшем таймфрейме для точного входа
+        bool isLowerBullish = lowerFastMa > lowerSlowMa && lowerCloses[^2] <= lowerSlowMa && lowerRsi < config.OversoldLevel;
+        bool isLowerBearish = lowerFastMa < lowerSlowMa && lowerCloses[^2] >= lowerSlowMa && lowerRsi > config.OverboughtLevel;
+
+        // Комбинированные условия с мультитаймфреймовым анализом
+        bool isBullish = (isHigherTrendBullish || !isHigherTrendBearish) && isPrimaryBullish && isLowerBullish;
+        bool isBearish = (isHigherTrendBearish || !isHigherTrendBullish) && isPrimaryBearish && isLowerBearish;
 
         if (isBullish)
         {
@@ -740,6 +857,54 @@ public class Program
         {
             await ExecuteTradeAsync(binanceClient, telegramBot, OrderSide.Sell, (decimal)currentPrice);
         }
+    }
+
+    private static async Task<List<IBinanceKline>> GetKlinesForTimeframe(BinanceRestClient client, KlineInterval timeframe)
+    {
+        var klinesResult = await client.SpotApi.ExchangeData.GetKlinesAsync(
+            config.Symbol,
+            timeframe,
+            limit: Math.Max(config.SlowMAPeriod, config.RSIPeriod) + 50);
+
+        if (!klinesResult.Success)
+        {
+            logger.LogError("Ошибка получения свечей для таймфрейма {0}: {1}", timeframe, klinesResult.Error);
+            return null;
+        }
+
+        return klinesResult.Data.ToList();
+    }
+
+    private static bool CheckLiveVolumeFilter(List<IBinanceKline> klines)
+    {
+        if (klines.Count < 2) return false;
+
+        var currentVolume = klines.Last().Volume;
+        var prevVolume = klines[^2].Volume;
+
+        // Абсолютный объем
+        if (currentVolume * klines.Last().ClosePrice < config.MinVolumeUSDT)
+            return false;
+
+        // Изменение объема
+        if (prevVolume == 0) return true;
+        var volumeChange = Math.Abs((currentVolume - prevVolume) / prevVolume);
+
+        return volumeChange >= config.VolumeChangeThreshold;
+    }
+
+    private static bool CheckLiveVolatilityFilter(List<IBinanceKline> klines)
+    {
+        if (klines.Count < config.VolatilityPeriod) return false;
+
+        var relevantKlines = klines.TakeLast(config.VolatilityPeriod).ToList();
+        var atr = CalculateATR(relevantKlines, config.VolatilityPeriod);
+
+        // Рассчитываем волатильность как процентное изменение ATR от цены
+        var currentPrice = klines.Last().ClosePrice;
+        var volatility = atr / currentPrice;
+
+        return volatility >= config.VolatilityThreshold;
     }
 
     private static async Task ExecuteTradeAsync(BinanceRestClient binanceClient, TelegramBotClient telegramBot, OrderSide side, decimal currentPrice)
@@ -913,8 +1078,6 @@ public class Program
         double rs = gains / losses;
         return 100 - (100 / (1 + rs));
     }
-
-
 
     public class BinancePosition
     {
