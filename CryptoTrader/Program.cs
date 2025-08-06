@@ -388,19 +388,29 @@ public class Program
 
     private static bool CheckVolumeFilter(List<IBinanceKline> klines, int currentIndex)
     {
-        if (currentIndex < 2) return true;
+        // Добавляем проверки
+        if (klines == null || klines.Count == 0 || currentIndex < 0 || currentIndex >= klines.Count)
+            return false;
 
-        var currentVolume = klines[currentIndex].Volume;
-        var prevVolume = klines[currentIndex - 1].Volume;
+        if (currentIndex < 2)
+            return true;
+
+        var currentKline = klines[currentIndex-1];
+        var prevKline = klines[currentIndex - 2];
+
+        // Проверка на нулевые значения
+        if (currentKline == null || prevKline == null)
+            return false;
 
         // Абсолютный объем
-        if (currentVolume * klines[currentIndex].ClosePrice < config.MinVolumeUSDT)
+        if (currentKline.Volume * currentKline.ClosePrice < config.MinVolumeUSDT)
             return false;
 
         // Изменение объема
-        if (prevVolume == 0) return true;
-        var volumeChange = Math.Abs((currentVolume - prevVolume) / prevVolume);
+        if (prevKline.Volume == 0)
+            return true;
 
+        var volumeChange = Math.Abs((currentKline.Volume - prevKline.Volume) / prevKline.Volume);
         return volumeChange >= config.VolumeChangeThreshold;
     }
 
@@ -464,267 +474,337 @@ public class Program
         var allKlines = new List<IBinanceKline>();
         var currentStartTime = config.BacktestStartDate;
 
-        while (currentStartTime < config.BacktestEndDate)
+        try
         {
-            var klinesResult = await binanceClient.SpotApi.ExchangeData.GetKlinesAsync(
-                config.Symbol,
-                config.BacktestInterval,
-                startTime: currentStartTime,
-                endTime: config.BacktestEndDate,
-                limit: 1000);
-
-            if (!klinesResult.Success)
+            while (currentStartTime < config.BacktestEndDate)
             {
-                logger.LogError("Ошибка получения данных: {Error}", klinesResult.Error);
-                return null;
+                var klinesResult = await binanceClient.SpotApi.ExchangeData.GetKlinesAsync(
+                    config.Symbol,
+                    config.BacktestInterval,
+                    startTime: currentStartTime,
+                    endTime: config.BacktestEndDate,
+                    limit: 1000);
+
+                if (!klinesResult.Success)
+                {
+                    logger.LogError("Ошибка получения данных: {Error}", klinesResult.Error);
+                    return null;
+                }
+
+                if (!klinesResult.Data.Any())
+                    break;
+
+                allKlines.AddRange(klinesResult.Data);
+                currentStartTime = klinesResult.Data.Last().OpenTime.AddMinutes(1);
+
+                // Добавляем задержку между запросами
+                await Task.Delay(250);
             }
-
-            if (!klinesResult.Data.Any()) break;
-
-            allKlines.AddRange(klinesResult.Data);
-            currentStartTime = klinesResult.Data.Last().OpenTime.AddMinutes(1);
-
-            await Task.Delay(200);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Ошибка при получении исторических данных");
+            return null;
         }
 
         logger.LogInformation("Получено {Count} свечей", allKlines.Count);
-        return allKlines;
+        return allKlines.Count > 0 ? allKlines : null;
     }
+
 
     private static async Task RunBacktest(BinanceRestClient binanceClient, TelegramBotClient telegramBot, string text, TradingParams parameters = null)
     {
-        parameters ??= new TradingParams(
-            config.FastMAPeriod,
-            config.SlowMAPeriod,
-            config.RSIPeriod,
-            config.OverboughtLevel,
-            config.OversoldLevel);
-
-        logger.LogInformation("Запуск бэктеста с {StartDate} по {EndDate}",
-            config.BacktestStartDate, config.BacktestEndDate);
-
-        var allKlines = await GetAllHistoricalData(binanceClient);
-        if (allKlines == null || !allKlines.Any()) return;
-
-        decimal balance = config.InitialBalance;
-        decimal position = 0;
-        decimal entryPrice = 0;
-        decimal stopLossPrice = 0;
-        decimal takeProfitPrice = 0;
-        var tradeHistory = new List<TradeRecord>();
-        var equityCurve = new List<decimal>();
-
-        for (int i = Math.Max(parameters.SlowMAPeriod, parameters.RSIPeriod); i < allKlines.Count; i++)
+        try
         {
-            var currentKline = allKlines[i];
-            var previousKlines = allKlines.Take(i).ToList();
+            // 1. Инициализация параметров
+            parameters ??= new TradingParams(
+                config.FastMAPeriod,
+                config.SlowMAPeriod,
+                config.RSIPeriod,
+                config.OverboughtLevel,
+                config.OversoldLevel);
 
-            // Проверка объема
-            if (!CheckVolumeFilter(previousKlines, i)) continue;
+            logger.LogInformation("=== НАЧАЛО БЭКТЕСТА ===");
+            logger.LogInformation($"Параметры: {parameters}");
+            logger.LogInformation($"Период: {config.BacktestStartDate:yyyy-MM-dd} - {config.BacktestEndDate:yyyy-MM-dd}");
+            logger.LogInformation($"Таймфрейм: {config.BacktestInterval}");
+            logger.LogInformation($"Начальный баланс: {config.InitialBalance}");
 
-            // Проверка волатильности
-            if (!CheckVolatilityFilter(previousKlines, i)) continue;
+            // 2. Получение исторических данных
+            logger.LogInformation("Загрузка исторических данных...");
+            var allKlines = await GetAllHistoricalData(binanceClient);
 
-            var closePrices = previousKlines.Select(k => (double)k.ClosePrice).ToArray();
-
-            var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
-            var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
-            var rsi = CalculateRsi(closePrices, parameters.RSIPeriod);
-            var currentPrice = (double)currentKline.ClosePrice;
-
-            // Проверка стоп-лосса и тейк-профита
-            if (position != 0)
+            if (allKlines == null || allKlines.Count == 0)
             {
-                if (position > 0 && (decimal)currentPrice <= stopLossPrice)
-                {
-                    var pnl = position * (stopLossPrice - entryPrice);
-                    balance += pnl;
-                    tradeHistory.Add(new TradeRecord(
-                        currentKline.OpenTime,
-                        "SELL (SL)",
-                        position,
-                        entryPrice,
-                        stopLossPrice,
-                        stopLossPrice,
-                        takeProfitPrice,
-                        pnl));
-                    position = 0;
-                    equityCurve.Add(balance);
-                    continue;
-                }
-                else if (position > 0 && (decimal)currentPrice >= takeProfitPrice)
-                {
-                    var pnl = position * (takeProfitPrice - entryPrice);
-                    balance += pnl;
-                    tradeHistory.Add(new TradeRecord(
-                        currentKline.OpenTime,
-                        "SELL (TP)",
-                        position,
-                        entryPrice,
-                        takeProfitPrice,
-                        stopLossPrice,
-                        takeProfitPrice,
-                        pnl));
-                    position = 0;
-                    equityCurve.Add(balance);
-                    continue;
-                }
-                else if (position < 0 && (decimal)currentPrice >= stopLossPrice)
-                {
-                    var pnl = position * (entryPrice - stopLossPrice);
-                    balance += pnl;
-                    tradeHistory.Add(new TradeRecord(
-                        currentKline.OpenTime,
-                        "BUY (SL)",
-                        Math.Abs(position),
-                        entryPrice,
-                        stopLossPrice,
-                        stopLossPrice,
-                        takeProfitPrice,
-                        pnl));
-                    position = 0;
-                    equityCurve.Add(balance);
-                    continue;
-                }
-                else if (position < 0 && (decimal)currentPrice <= takeProfitPrice)
-                {
-                    var pnl = position * (entryPrice - takeProfitPrice);
-                    balance += pnl;
-                    tradeHistory.Add(new TradeRecord(
-                        currentKline.OpenTime,
-                        "BUY (TP)",
-                        Math.Abs(position),
-                        entryPrice,
-                        takeProfitPrice,
-                        stopLossPrice,
-                        takeProfitPrice,
-                        pnl));
-                    position = 0;
-                    equityCurve.Add(balance);
-                    continue;
-                }
+                logger.LogError("Не удалось получить исторические данные");
+                await telegramBot.SendMessage(config.TelegramChatId, "❌ Ошибка: не удалось получить исторические данные");
+                return;
             }
 
-            bool isBullish = fastMa > slowMa && closePrices[^2] <= slowMa && rsi < parameters.OverboughtLevel;
-            bool isBearish = fastMa < slowMa && closePrices[^2] >= slowMa && rsi > parameters.OversoldLevel;
+            logger.LogInformation($"Получено {allKlines.Count} свечей");
+            logger.LogInformation($"Пример данных: Первая свеча - {allKlines.First().OpenTime}, Последняя - {allKlines.Last().OpenTime}");
 
-            if (isBullish && position <= 0)
+            // 3. Инициализация переменных для торговли
+            decimal balance = config.InitialBalance;
+            decimal position = 0;
+            decimal entryPrice = 0;
+            var tradeHistory = new List<TradeRecord>();
+            var equityCurve = new List<decimal> { balance };
+            int signalsGenerated = 0;
+            int tradesExecuted = 0;
+
+            // 4. Определение минимального количества свечей для индикаторов
+            int requiredBars = new[] { parameters.SlowMAPeriod, parameters.RSIPeriod, config.VolatilityPeriod }.Max() + 1;
+
+            if (allKlines.Count < requiredBars)
             {
-                if (position < 0)
+                logger.LogError($"Недостаточно данных. Требуется: {requiredBars}, получено: {allKlines.Count}");
+                return;
+            }
+
+            // 5. Основной торговый цикл
+            logger.LogInformation("Начало обработки данных...");
+            for (int i = requiredBars; i < allKlines.Count; i++)
+            {
+                var currentKline = allKlines[i];
+                var previousKlines = allKlines.Take(i).ToList();
+                var closePrices = previousKlines.Select(k => (double)k.ClosePrice).ToArray();
+                var currentPrice = (double)currentKline.ClosePrice;
+
+                // Рассчитываем индикаторы
+                var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
+                var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
+                var rsi = CalculateRsi(closePrices, parameters.RSIPeriod);
+
+                // Логируем индикаторы для каждой 50-й свечи
+                if (i % 50 == 0)
                 {
-                    var pnl = position * ((decimal)currentPrice - entryPrice);
-                    balance += pnl;
+                    logger.LogInformation($"Свеча {i}: Time={currentKline.OpenTime}, Price={currentPrice:F2}, " +
+                        $"MA{parameters.FastMAPeriod}={fastMa:F2}, MA{parameters.SlowMAPeriod}={slowMa:F2}, RSI={rsi:F2}");
+                }
+
+                // Упрощенные условия для тестирования (можно заменить на оригинальные)
+                bool isBullish = fastMa > slowMa && rsi < parameters.OverboughtLevel;
+                bool isBearish = fastMa < slowMa && rsi > parameters.OversoldLevel;
+
+                // Обработка открытых позиций
+                if (position != 0)
+                {
+                    bool shouldClose = false;
+                    decimal exitPrice = 0;
+                    string exitReason = "";
+
+                    if (position > 0) // Длинная позиция
+                    {
+                        if ((decimal)currentPrice <= entryPrice * (1m - config.StopLossPercent))
+                        {
+                            exitPrice = entryPrice * (1m - config.StopLossPercent);
+                            exitReason = "SL";
+                            shouldClose = true;
+                        }
+                        else if ((decimal)currentPrice >= entryPrice * (1m + config.TakeProfitPercent))
+                        {
+                            exitPrice = entryPrice * (1m + config.TakeProfitPercent);
+                            exitReason = "TP";
+                            shouldClose = true;
+                        }
+                    }
+                    else // Короткая позиция
+                    {
+                        if ((decimal)currentPrice >= entryPrice * (1m + config.StopLossPercent))
+                        {
+                            exitPrice = entryPrice * (1m + config.StopLossPercent);
+                            exitReason = "SL";
+                            shouldClose = true;
+                        }
+                        else if ((decimal)currentPrice <= entryPrice * (1m - config.TakeProfitPercent))
+                        {
+                            exitPrice = entryPrice * (1m - config.TakeProfitPercent);
+                            exitReason = "TP";
+                            shouldClose = true;
+                        }
+                    }
+
+                    if (shouldClose)
+                    {
+                        decimal pnl = position > 0
+                            ? position * (exitPrice - entryPrice)
+                            : position * (entryPrice - exitPrice);
+
+                        balance += pnl;
+                        tradesExecuted++;
+
+                        tradeHistory.Add(new TradeRecord(
+                            currentKline.OpenTime,
+                            position > 0 ? $"SELL ({exitReason})" : $"BUY ({exitReason})",
+                            Math.Abs(position),
+                            entryPrice,
+                            exitPrice,
+                            position > 0 ? entryPrice * (1m - config.StopLossPercent) : entryPrice * (1m + config.StopLossPercent),
+                            position > 0 ? entryPrice * (1m + config.TakeProfitPercent) : entryPrice * (1m - config.TakeProfitPercent),
+                            pnl));
+
+                        position = 0;
+                        equityCurve.Add(balance);
+                        continue;
+                    }
+                }
+
+                // Генерация новых сигналов
+                if (isBullish && position <= 0)
+                {
+                    signalsGenerated++;
+
+                    // Закрытие короткой позиции, если есть
+                    if (position < 0)
+                    {
+                        decimal pnl = position * ((decimal)currentPrice - entryPrice);
+                        balance += pnl;
+                        tradesExecuted++;
+
+                        tradeHistory.Add(new TradeRecord(
+                            currentKline.OpenTime,
+                            "BUY (Close)",
+                            Math.Abs(position),
+                            entryPrice,
+                            (decimal)currentPrice,
+                            0, 0, pnl));
+                    }
+
+                    // Открытие длинной позиции
+                    decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
+                    position = quantity;
+                    entryPrice = (decimal)currentPrice;
+
                     tradeHistory.Add(new TradeRecord(
                         currentKline.OpenTime,
                         "BUY",
-                        Math.Abs(position),
+                        quantity,
                         entryPrice,
-                        (decimal)currentPrice,
-                        stopLossPrice,
-                        takeProfitPrice,
-                        pnl));
+                        0,
+                        entryPrice * (1m - config.StopLossPercent),
+                        entryPrice * (1m + config.TakeProfitPercent),
+                        0));
                 }
-
-                decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
-                position = quantity;
-                entryPrice = (decimal)currentPrice;
-                stopLossPrice = entryPrice * (1 - config.StopLossPercent);
-                takeProfitPrice = entryPrice * (1 + config.TakeProfitPercent);
-
-                tradeHistory.Add(new TradeRecord(
-                    currentKline.OpenTime,
-                    "BUY",
-                    quantity,
-                    entryPrice,
-                    0,
-                    stopLossPrice,
-                    takeProfitPrice,
-                    0));
-            }
-            else if (isBearish && position >= 0)
-            {
-                if (position > 0)
+                else if (isBearish && position >= 0)
                 {
-                    var pnl = position * ((decimal)currentPrice - entryPrice);
-                    balance += pnl;
+                    signalsGenerated++;
+
+                    // Закрытие длинной позиции, если есть
+                    if (position > 0)
+                    {
+                        decimal pnl = position * ((decimal)currentPrice - entryPrice);
+                        balance += pnl;
+                        tradesExecuted++;
+
+                        tradeHistory.Add(new TradeRecord(
+                            currentKline.OpenTime,
+                            "SELL (Close)",
+                            position,
+                            entryPrice,
+                            (decimal)currentPrice,
+                            0, 0, pnl));
+                    }
+
+                    // Открытие короткой позиции
+                    decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
+                    position = -quantity;
+                    entryPrice = (decimal)currentPrice;
+
                     tradeHistory.Add(new TradeRecord(
                         currentKline.OpenTime,
                         "SELL",
-                        position,
+                        quantity,
                         entryPrice,
-                        (decimal)currentPrice,
-                        stopLossPrice,
-                        takeProfitPrice,
-                        pnl));
+                        0,
+                        entryPrice * (1m + config.StopLossPercent),
+                        entryPrice * (1m - config.TakeProfitPercent),
+                        0));
                 }
 
-                decimal quantity = (balance * config.RiskPerTrade) / (decimal)currentPrice;
-                position = -quantity;
-                entryPrice = (decimal)currentPrice;
-                stopLossPrice = entryPrice * (1 + config.StopLossPercent);
-                takeProfitPrice = entryPrice * (1 - config.TakeProfitPercent);
-
-                tradeHistory.Add(new TradeRecord(
-                    currentKline.OpenTime,
-                    "SELL",
-                    quantity,
-                    entryPrice,
-                    0,
-                    stopLossPrice,
-                    takeProfitPrice,
-                    0));
+                // Обновление кривой баланса
+                equityCurve.Add(balance + position * ((decimal)currentPrice - entryPrice));
             }
 
-            equityCurve.Add(balance + position * ((decimal)currentPrice - entryPrice));
-        }
+            // 6. Закрытие последней позиции (если есть)
+            if (position != 0)
+            {
+                var lastPrice = (double)allKlines.Last().ClosePrice;
+                decimal pnl = position * ((decimal)lastPrice - entryPrice);
+                balance += pnl;
+                tradesExecuted++;
 
-        if (position != 0)
+                tradeHistory.Add(new TradeRecord(
+                    allKlines.Last().OpenTime,
+                    position > 0 ? "SELL (Close)" : "BUY (Close)",
+                    Math.Abs(position),
+                    entryPrice,
+                    (decimal)lastPrice,
+                    0, 0, pnl));
+            }
+
+            // 7. Расчет статистики
+            decimal profit = balance - config.InitialBalance;
+            decimal profitPercentage = (balance / config.InitialBalance - 1) * 100;
+            decimal winRate = tradeHistory.Count(t => t.PnL > 0) * 100m / Math.Max(1, tradeHistory.Count);
+            decimal maxDrawdown = CalculateMaxDrawdown(equityCurve);
+            int totalTrades = tradeHistory.Count(t => t.IsClosed);
+            // 8. Вывод результатов
+            logger.LogInformation("\n=== РЕЗУЛЬТАТЫ БЭКТЕСТА ===");
+            logger.LogInformation($"Сигналов сгенерировано: {signalsGenerated}");
+            logger.LogInformation($"Сделок выполнено: {tradesExecuted}");
+            logger.LogInformation($"Конечный баланс: {balance:F2}");
+            logger.LogInformation($"Прибыль: {profit:F2} ({profitPercentage:F2}%)");
+            logger.LogInformation($"Процент прибыльных сделок: {winRate:F2}%");
+            logger.LogInformation($"Максимальная просадка: {maxDrawdown:F2}%");
+
+           // 9. Отправка результатов в Telegram
+        var message = $"📊 Результаты бэктеста {text}: {config.Symbol}\n" +
+                     $"Период: {config.BacktestStartDate:dd.MM.yyyy} - {config.BacktestEndDate:dd.MM.yyyy}\n" +
+                     $"Таймфрейм: {config.BacktestInterval}\n" +
+                     $"Баланс: {config.InitialBalance:F2} → {balance:F2}\n" +
+                     $"Прибыль: {profit:F2} ({profitPercentage:F2}%)\n" +
+                     $"Сделок: {totalTrades} | Прибыльных: {winRate:F2}%\n" +
+                     $"Просадка: {maxDrawdown:F2}%";
+
+        await telegramBot.SendMessage(config.TelegramChatId, message);
+
+            // 10. Сохранение истории сделок
+            SaveTradeHistory(tradeHistory);
+        }
+        catch (Exception ex)
         {
-            var lastPrice = (double)allKlines.Last().ClosePrice;
-            var pnl = position * ((decimal)lastPrice - entryPrice);
-            balance += pnl;
-
-            tradeHistory.Add(new TradeRecord(
-                allKlines.Last().OpenTime,
-                position > 0 ? "SELL" : "BUY",
-                Math.Abs(position),
-                entryPrice,
-                (decimal)lastPrice,
-                stopLossPrice,
-                takeProfitPrice,
-                pnl));
+            logger.LogError(ex, "Ошибка в RunBacktest");
+            await telegramBot.SendMessage(config.TelegramChatId,
+                $"❌ Ошибка при выполнении бэктеста: {ex.Message}");
         }
+    }
 
-        logger.LogInformation("\n=== РЕЗУЛЬТАТЫ БЭКТЕСТА ===");
-        logger.LogInformation("Использованные параметры: {Parameters}", parameters);
-        logger.LogInformation("Начальный баланс: {InitialBalance}", config.InitialBalance);
-        logger.LogInformation("Конечный баланс: {FinalBalance}", balance);
-        logger.LogInformation("Прибыль: {PnL} ({Percentage}%)",
-            (balance - config.InitialBalance).ToString("F2"),
-            ((balance / config.InitialBalance - 1) * 100).ToString("F2"));
 
-        int totalTrades = tradeHistory.Count(t => t.IsClosed);
-        int profitableTrades = tradeHistory.Count(t => t.IsClosed && t.PnL > 0);
 
-        logger.LogInformation("Сделок: {TradesCount}", totalTrades);
-        logger.LogInformation("Прибыльных: {ProfitableTrades} ({Percentage}%)",
-            profitableTrades,
-            (totalTrades > 0 ? (double)profitableTrades / totalTrades * 100 : 0).ToString("F2"));
 
-        if (tradeHistory.Any(t => t.IsClosed))
+    private static void SaveTradeHistory(List<TradeRecord> history)
+    {
+        try
         {
-            var maxDrawdown = CalculateMaxDrawdown(equityCurve);
-            logger.LogInformation("Максимальная просадка: {MaxDrawdown}%", maxDrawdown.ToString("F2"));
-        }
+            string fileName = $"TradeHistory_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
+            using var writer = new StreamWriter(fileName);
 
-        await telegramBot.SendMessage(
-            chatId: config.TelegramChatId,
-            text: $"📊 Результаты бэктеста {text}: {config.Symbol}\n" +
-                  $"Период: {config.BacktestStartDate:dd.MM.yyyy} - {config.BacktestEndDate:dd.MM.yyyy}\n" +
-                  $"Параметры: {parameters}\n" +
-                  $"Баланс: {config.InitialBalance:F2} → {balance:F2}\n" +
-                  $"Прибыль: {(balance - config.InitialBalance):F2} ({(balance / config.InitialBalance - 1) * 100:F2}%)\n" +
-                  $"Сделок: {totalTrades} | Прибыльных: {profitableTrades}");
+            writer.WriteLine("Timestamp,Type,Quantity,EntryPrice,ExitPrice,StopLoss,TakeProfit,PnL");
+
+            foreach (var trade in history)
+            {
+                writer.WriteLine($"{trade.Timestamp:yyyy-MM-dd HH:mm:ss},{trade.Type}," +
+                                $"{trade.Quantity:F6},{trade.EntryPrice:F2},{trade.ExitPrice:F2}," +
+                                $"{trade.StopLossPrice:F2},{trade.TakeProfitPrice:F2},{trade.PnL:F2}");
+            }
+
+            logger.LogInformation("История сделок сохранена в файл: {FileName}", fileName);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Ошибка при сохранении истории сделок");
+        }
     }
 
     private static decimal CalculateMaxDrawdown(List<decimal> equityCurve)
