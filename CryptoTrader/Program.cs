@@ -843,8 +843,8 @@ public class Program
                 }
             }
 
-            // Улучшенные условия для входа с учетом тренда старшего ТФ
-            bool isHigherTrendBullish = higherFastMa > higherSlowMa;
+            // Улучшенные условия для входа с учетом тренда старшего ТФ       
+        bool isHigherTrendBullish = higherFastMa > higherSlowMa;
             bool isHigherTrendBearish = higherFastMa < higherSlowMa;
 
             bool isPrimaryBullish = fastMa > slowMa &&
@@ -1069,10 +1069,6 @@ public class Program
             int profitableTrades = 0;
             decimal maxBalance = balance;
             decimal maxDrawdown = 0;
-
-            bool trailingActive = false;
-            decimal highestPriceSinceEntry = 0;
-            decimal lowestPriceSinceEntry = 0;
 
             int requiredBars = new[] {
                 parameters.SlowMAPeriod,
@@ -1401,8 +1397,8 @@ public class Program
                 equityCurve.Add(balance + position * ((decimal)currentPrice - entryPrice));
             }
 
-            // Закрытие последней позиции
-            if (position != 0)
+                // Закрытие последней позиции
+                if (position != 0)
             {
                 var lastPrice = (double)allKlines.Last().ClosePrice;
                 decimal pnl = position > 0
@@ -1434,7 +1430,9 @@ public class Program
             int totalTrades = tradeHistory.Count(t => t.IsClosed);
             decimal winRate = totalTrades > 0 ?
                 tradeHistory.Count(t => t.IsClosed && t.PnL > 0) * 100m / totalTrades : 0;
-            decimal sharpeRatio = (decimal)CalculateSharpeRatio(equityCurve);
+
+            // ИСПРАВЛЕНИЕ: Корректный расчет коэффициента Шарпа для часовых данных
+            decimal sharpeRatio = (decimal)CalculateSharpeRatio(equityCurve, true);
             decimal maxDrawdownPercent = (decimal)CalculateMaxDrawdown(equityCurve);
 
             logger.LogInformation("\n=== РЕЗУЛЬТАТЫ БЭКТЕСТА ===");
@@ -1540,11 +1538,12 @@ public class Program
         public bool IsActive { get; set; }
     }
 
+
     // Проверка рынка и выполнение сделок с трейлинг-стопом
     private static async Task CheckMarketAndTradeAsync(
-        BinanceRestClient binanceClient,
-        TelegramBotClient telegramBot,
-        TrailingStopState trailingStopState)
+         BinanceRestClient binanceClient,
+         TelegramBotClient telegramBot,
+         TrailingStopState trailingStopState)
     {
         if (DateTime.Now.Date != lastTradeDate.Date)
         {
@@ -1605,8 +1604,9 @@ public class Program
         var (lowerMacdLine, lowerSignalLine, _) = CalculateMacd(lowerCloses, config.FastEmaPeriod / 2, config.SlowEmaPeriod / 2, config.SignalPeriod / 2);
         var (lowerUpperBb, lowerMiddleBb, lowerLowerBb) = CalculateBollingerBands(lowerCloses, config.BbPeriod / 2, config.BbStdDev);
 
-        // Расчет ATR с защитой от нуля
-        var atr = CalculateATR(primaryKlines.TakeLast(14).ToList(), 14);
+        /// Расчет ATR с защитой от нуля
+        var atrPeriod = (int)Math.Ceiling(24 / (decimal)config.PrimaryTimeframe.ToTimeSpan().TotalHours);
+        var atr = CalculateATR(primaryKlines.TakeLast(atrPeriod).ToList(), atrPeriod);
         var safeAtr = atr > 0 ? atr : primaryKlines.Last().ClosePrice * config.MinAtrPercent;
 
         // Получение текущей цены
@@ -1925,6 +1925,7 @@ public class Program
     }
 
     // Получение открытых позиций
+    // Получение открытых позиций
     private static async Task<List<BinancePosition>> GetOpenPositions(BinanceRestClient client)
     {
         var result = new List<BinancePosition>();
@@ -1967,6 +1968,38 @@ public class Program
 
         return result;
     }
+    //private static async Task<List<BinancePosition>> GetOpenPositions(BinanceRestClient client)
+    //{
+    //    var result = new List<BinancePosition>();
+
+    //    try
+    //    {
+    //        // Использование фьючерсного API для получения реальных позиций
+    //        var positionInfo = await client.UsdFuturesApi.Account.GetPositionInformationAsync();
+    //        if (!positionInfo.Success)
+    //        {
+    //            logger.LogError("Ошибка получения информации о позициях: {Error}", positionInfo.Error);
+    //            return result;
+    //        }
+
+    //        return positionInfo.Data
+    //            .Where(p => p.Symbol == config.Symbol && p.Quantity != 0)
+    //            .Select(p => new BinancePosition
+    //            {
+    //                Symbol = p.Symbol,
+    //                PositionAmount = p.Quantity,
+    //                EntryPrice = p.EntryPrice,
+    //                MarkPrice = p.MarkPrice,
+    //                Side = p.PositionSide
+    //            })
+    //            .ToList();
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        logger.LogError(ex, "Ошибка при получении позиций");
+    //        return result;
+    //    }
+    //}
 
     // Расчет простого скользящего среднего
     private static double CalculateSma(double[] closes, int period)
@@ -2026,27 +2059,47 @@ public class Program
             return (lastValue, lastValue, 0);
         }
 
-        // Расчет EMA
-        var fastEma = CalculateEma(closes, fastPeriod);
-        var slowEma = CalculateEma(closes, slowPeriod);
-        var macdLine = fastEma - slowEma;
+        // Расчет EMA с правильной инициализацией
+        double[] fastEmaValues = new double[closes.Length];
+        double[] slowEmaValues = new double[closes.Length];
+
+        double fastK = 2.0 / (fastPeriod + 1);
+        double slowK = 2.0 / (slowPeriod + 1);
+
+        fastEmaValues[0] = closes[0];
+        slowEmaValues[0] = closes[0];
+
+        for (int i = 1; i < closes.Length; i++)
+        {
+            fastEmaValues[i] = closes[i] * fastK + fastEmaValues[i - 1] * (1 - fastK);
+            slowEmaValues[i] = closes[i] * slowK + slowEmaValues[i - 1] * (1 - slowK);
+        }
+
+        double macdLine = fastEmaValues.Last() - slowEmaValues.Last();
 
         if (closes.Length < slowPeriod + signalPeriod)
         {
             return (macdLine, macdLine, 0);
         }
 
-        // Расчет сигнальной линии (EMA от MACD)
-        var macdValues = new double[closes.Length];
+        // Расчет сигнальной линии
+        double[] macdValues = new double[closes.Length];
         for (int i = 0; i < closes.Length; i++)
         {
-            var fastEmaLocal = CalculateEma(closes.Take(i + 1).ToArray(), fastPeriod);
-            var slowEmaLocal = CalculateEma(closes.Take(i + 1).ToArray(), slowPeriod);
-            macdValues[i] = fastEmaLocal - slowEmaLocal;
+            macdValues[i] = fastEmaValues[i] - slowEmaValues[i];
         }
 
-        var signalLine = CalculateEma(macdValues.Skip(macdValues.Length - signalPeriod * 2).ToArray(), signalPeriod);
-        var histogram = macdLine - signalLine;
+        double[] signalLineValues = new double[macdValues.Length];
+        double signalK = 2.0 / (signalPeriod + 1);
+        signalLineValues[0] = macdValues[0];
+
+        for (int i = 1; i < macdValues.Length; i++)
+        {
+            signalLineValues[i] = macdValues[i] * signalK + signalLineValues[i - 1] * (1 - signalK);
+        }
+
+        double signalLine = signalLineValues.Last();
+        double histogram = macdLine - signalLine;
 
         return (macdLine, signalLine, histogram);
     }
@@ -2109,7 +2162,6 @@ public class Program
         if (trueRanges.Count < period)
             return 0;
 
-        // Сглаженное среднее для ATR
         decimal atr = trueRanges.Take(period).Average();
         for (int i = period; i < trueRanges.Count; i++)
         {
@@ -2130,7 +2182,8 @@ public class Program
                 return true;
             }
 
-            // Получаем данные старшего таймфрейма для анализа тренда
+            // Использование реального коэффициента агрегации
+            int aggregationFactor = GetAggregationFactor(config.PrimaryTimeframe, config.HigherTimeframe);
             var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(recentKlines, config.HigherTimeframe);
 
             var closes = recentKlines.Select(k => (double)k.ClosePrice).ToArray();
@@ -2143,18 +2196,16 @@ public class Program
             var atr = (float)CalculateATR(recentKlines.TakeLast(14).ToList(), 14);
             var volumeChange = (float)(volumes.Last() / volumes.Take(volumes.Length - 1).Average() - 1);
 
-            // Расчет тренда на старшем таймфрейме
             var higherCloses = higherTimeframeKlines
                 .Where(k => k.OpenTime <= recentKlines.Last().OpenTime)
-                .TakeLast(config.MlLookbackPeriod / 4)
+                .TakeLast(config.MlLookbackPeriod / aggregationFactor)
                 .Select(k => (double)k.ClosePrice)
                 .ToArray();
 
-            var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod / 4);
-            var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod / 4);
+            var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod);
+            var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod);
             float higherTrend = (float)(higherFastMa - higherSlowMa);
 
-            // Расчет рыночных настроений
             float marketSentiment = (float)((closes.Last() - middleBB) / (middleBB * 0.01));
 
             var predictionData = new MarketData
@@ -2366,7 +2417,7 @@ public class Program
     }
 
     // Расчет коэффициента Шарпа
-    private static double CalculateSharpeRatio(List<decimal> equityCurve)
+    private static double CalculateSharpeRatio(List<decimal> equityCurve, bool isHourly = false)
     {
         if (equityCurve.Count < 2) return 0;
 
@@ -2383,11 +2434,14 @@ public class Program
         double stdDev = Math.Sqrt(dailyReturns.Sum(r => Math.Pow(r - avgReturn, 2)) / dailyReturns.Count);
 
         if (stdDev == 0) return 0;
-        return avgReturn / stdDev * Math.Sqrt(365);
+
+        // Корректировка для часовых данных
+        double annualizationFactor = isHourly ? Math.Sqrt(365 * 24) : Math.Sqrt(365);
+        return avgReturn / stdDev * annualizationFactor;
     }
 
     // Расчет максимальной просадки
-    private static decimal CalculateMaxDrawdown(List<decimal> equityCurve)
+    private static double CalculateMaxDrawdown(List<decimal> equityCurve)
     {
         if (equityCurve.Count == 0) return 0;
 
@@ -2401,7 +2455,7 @@ public class Program
             if (drawdown > maxDrawdown) maxDrawdown = drawdown;
         }
 
-        return maxDrawdown;
+        return (double)maxDrawdown;
     }
 
     // Мутация параметров для оптимизации с адаптивным шагом
@@ -2487,5 +2541,32 @@ public class Program
     {
         Long,
         Short
+    }
+
+}
+
+public static class KlineIntervalExtensions
+{
+    public static TimeSpan ToTimeSpan(this KlineInterval interval)
+    {
+        return interval switch
+        {
+            KlineInterval.OneMinute => TimeSpan.FromMinutes(1),
+            KlineInterval.ThreeMinutes => TimeSpan.FromMinutes(3),
+            KlineInterval.FiveMinutes => TimeSpan.FromMinutes(5),
+            KlineInterval.FifteenMinutes => TimeSpan.FromMinutes(15),
+            KlineInterval.ThirtyMinutes => TimeSpan.FromMinutes(30),
+            KlineInterval.OneHour => TimeSpan.FromHours(1),
+            KlineInterval.TwoHour => TimeSpan.FromHours(2),
+            KlineInterval.FourHour => TimeSpan.FromHours(4),
+            KlineInterval.SixHour => TimeSpan.FromHours(6),
+            KlineInterval.EightHour => TimeSpan.FromHours(8),
+            KlineInterval.TwelveHour => TimeSpan.FromHours(12),
+            KlineInterval.OneDay => TimeSpan.FromDays(1),
+            KlineInterval.ThreeDay => TimeSpan.FromDays(3),
+            KlineInterval.OneWeek => TimeSpan.FromDays(7),
+            KlineInterval.OneMonth => TimeSpan.FromDays(30),
+            _ => throw new ArgumentException($"Unsupported interval: {interval}")
+        };
     }
 }
