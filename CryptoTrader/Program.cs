@@ -1,53 +1,57 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using Binance.Net.Clients;
+﻿using Binance.Net.Clients;
 using Binance.Net.Enums;
 using Binance.Net.Interfaces;
+using Binance.Net.Objects.Models.Spot.Socket;
 using CryptoExchange.Net.Authentication;
 using Microsoft.Extensions.Logging;
 using Microsoft.ML;
 using Microsoft.ML.Data;
 using Microsoft.ML.Trainers;
 using Microsoft.ML.Transforms;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
 using Telegram.Bot;
 
 public class Program
 {
-    // Конфигурация бота
+    // Конфигурация бота с подробными комментариями
     public class BotConfig
     {
+        // API ключи
         public string ApiKey { get; set; } = "YOUR_BINANCE_API_KEY";
         public string ApiSecret { get; set; } = "YOUR_BINANCE_API_SECRET";
+
+        // Настройки Telegram для уведомлений
         public string TelegramToken { get; set; } = "6299377057:AAHaNlY93hdrdQVanTPgmMibgQt41UDidRA";
         public string TelegramChatId { get; set; } = "1314937104";
         public string Symbol { get; set; } = "BTCUSDT";
 
         // Управление рисками
-        public decimal RiskPerTrade { get; set; } = 0.02m; // Риск на сделку (2%)
-        public decimal MaxDailyLossPercent { get; set; } = 0.10m; // Макс дневная просадка (10%)
+        public decimal RiskPerTrade { get; set; } = 0.02m; // Риск 2% от баланса на сделку
+        public decimal MaxDailyLossPercent { get; set; } = 0.10m; // Макс дневная просадка 10%
         public decimal AtrMultiplierSL { get; set; } = 1.5m; // Множитель ATR для стоп-лосса
         public decimal AtrMultiplierTP { get; set; } = 3.0m; // Множитель ATR для тейк-профита
         public decimal MinAtrPercent { get; set; } = 0.01m; // Минимальное значение ATR (1% от цены)
-        public decimal MinOrderSize { get; set; } = 0.001m; // Минимальный размер ордера
-        public decimal MaxPositionSizePercent { get; set; } = 0.1m; // Макс размер позиции (10% от баланса)
+        public decimal MinOrderSize { get; set; } = 0.001m; // Минимальный размер ордера BTC
+        public decimal MaxPositionSizePercent { get; set; } = 0.1m; // Макс размер позиции 10% от баланса
 
-        // Диапазоны параметров
+        // Диапазоны параметров для оптимизации
         public int[] FastMAPeriodRange { get; set; } = new[] { 5, 50 };
         public int[] SlowMAPeriodRange { get; set; } = new[] { 15, 100 };
         public int[] RSIPeriodRange { get; set; } = new[] { 10, 30 };
         public double[] OverboughtLevelRange { get; set; } = new[] { 60.0, 80.0 };
         public double[] OversoldLevelRange { get; set; } = new[] { 20.0, 40.0 };
 
-        // Фильтры
+        // Фильтры рынка
         public decimal MinVolumeUSDT { get; set; } = 1000000m; // Минимальный объем в USDT
         public decimal VolumeChangeThreshold { get; set; } = 0.5m; // Порог изменения объема
         public decimal VolatilityThreshold { get; set; } = 0.02m; // Минимальная волатильность
         public int VolatilityPeriod { get; set; } = 14; // Период для расчета волатильности
 
-        // Таймфреймы
+        // Таймфреймы для анализа
         public KlineInterval PrimaryTimeframe { get; set; } = KlineInterval.OneHour;
         public KlineInterval HigherTimeframe { get; set; } = KlineInterval.FourHour;
         public KlineInterval LowerTimeframe { get; set; } = KlineInterval.FifteenMinutes;
@@ -64,7 +68,7 @@ public class Program
         public int SlowEmaPeriod { get; set; } = 26;
         public int SignalPeriod { get; set; } = 9;
 
-        // Настройки ML
+        // Настройки машинного обучения
         public int MlLookbackPeriod { get; set; } = 100;
         public int MlPredictionHorizon { get; set; } = 5;
         public double MlConfidenceThreshold { get; set; } = 0.6;
@@ -79,8 +83,13 @@ public class Program
         public int OptimizationPopulationSize { get; set; } = 50;
         public int CheckIntervalMinutes { get; set; } = 5;
         public double OptimizationMinWinRate { get; set; } = 0.55; // Минимальный процент прибыльных сделок
+        public double OptimizationMinProfitRatio { get; set; } = 1.0; // Минимальный коэффициент прибыльности
+        public double OptimizationSharpeWeight { get; set; } = 0.4; // Вес коэффициента Шарпа
+        public double OptimizationProfitWeight { get; set; } = 0.3; // Вес коэффициента прибыльности
+        public double OptimizationWinRateWeight { get; set; } = 0.2; // Вес процента прибыльных сделок
+        public double OptimizationDrawdownWeight { get; set; } = 0.1; // Вес максимальной просадки
 
-        // Режимы работы
+        // Режимы работы бота
         public bool BacktestMode { get; set; } = true;
         public bool OptimizeMode { get; set; } = true;
         public bool LiveTradeMode { get; set; } = false;
@@ -91,7 +100,7 @@ public class Program
         public decimal CommissionPercent { get; set; } = 0.075m; // Комиссия 0.075%
     }
 
-    // Параметры торговли
+    // Параметры торговой стратегии
     public record TradingParams(
         int FastMAPeriod,
         int SlowMAPeriod,
@@ -107,7 +116,7 @@ public class Program
             $"BB(P={BbPeriod},SD={BbStdDev:F1})";
     }
 
-    // Запись о сделке
+    // Запись о сделке с полной информацией
     public record TradeRecord(
         DateTime Timestamp,
         string Type,
@@ -123,7 +132,7 @@ public class Program
         public bool IsClosed => ExitPrice != 0;
     }
 
-    // Данные для ML
+    // Данные для машинного обучения
     public class MarketData
     {
         [LoadColumn(0)] public float Open { get; set; }
@@ -140,11 +149,13 @@ public class Program
         [LoadColumn(11)] public float BBLower { get; set; }
         [LoadColumn(12)] public float ATR { get; set; }
         [LoadColumn(13)] public float VolumeChange { get; set; }
+        [LoadColumn(14)] public float HigherTrend { get; set; }
+        [LoadColumn(15)] public float MarketSentiment { get; set; }
         [ColumnName("Label")]
         public bool Target { get; set; }
     }
 
-    // Предсказание ML
+    // Предсказание модели машинного обучения
     public class MarketPrediction
     {
         [ColumnName("PredictedLabel")]
@@ -156,6 +167,7 @@ public class Program
         public bool ConfirmedPrediction => PredictedLabel && Score >= (float)config.MlConfidenceThreshold;
     }
 
+    // Глобальные переменные
     private static BotConfig config = new BotConfig();
     private static ILogger logger;
     private static decimal dailyPnL = 0;
@@ -164,7 +176,9 @@ public class Program
     private static ITransformer mlModel;
     private static DateTime lastModelTrainingTime = DateTime.MinValue;
     private static List<TradeRecord> tradeHistory = new List<TradeRecord>();
+    private static Dictionary<DateTime, decimal> dailyBalances = new Dictionary<DateTime, decimal>();
 
+    // Основной метод программы
     public static async Task Main(string[] args)
     {
         // Настройка логгера
@@ -172,19 +186,19 @@ public class Program
         {
             builder.AddConsole();
             builder.SetMinimumLevel(LogLevel.Debug);
+            builder.AddFile("logs/bot_{Date}.log");
         });
 
         logger = loggerFactory.CreateLogger("CryptoBot");
         var telegramBot = new TelegramBotClient(config.TelegramToken);
+
         try
         {
-            // Инициализация клиентов
+            // Инициализация клиента Binance
             var binanceClient = new BinanceRestClient(options =>
             {
                 options.ApiCredentials = new ApiCredentials(config.ApiKey, config.ApiSecret);
             });
-
-            //var telegramBot = new TelegramBotClient(config.TelegramToken);
 
             // Режим бэктеста
             if (config.BacktestMode)
@@ -206,7 +220,7 @@ public class Program
                 }
             }
 
-            // Режим оптимизации
+            // Режим оптимизации параметров
             if (config.OptimizeMode)
             {
                 await OptimizeParameters(binanceClient, telegramBot);
@@ -242,7 +256,7 @@ public class Program
         }
     }
 
-    // Инициализация модели ML
+    // Инициализация модели машинного обучения
     private static async Task TrainInitialModel(BinanceRestClient binanceClient)
     {
         try
@@ -273,7 +287,7 @@ public class Program
         }
     }
 
-    // Подготовка данных для ML
+    // Подготовка данных для машинного обучения с улучшенными фичами
     private static List<MarketData> PrepareMLData(List<IBinanceKline> klines)
     {
         var mlData = new List<MarketData>();
@@ -285,6 +299,9 @@ public class Program
 
         int positiveCount = 0;
         int negativeCount = 0;
+
+        // Получаем данные старшего таймфрейма для анализа тренда
+        var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(klines, config.HigherTimeframe);
 
         for (int i = config.MlLookbackPeriod; i < klines.Count - config.MlPredictionHorizon; i++)
         {
@@ -301,15 +318,34 @@ public class Program
             var (macdLine, signalLine, _) = CalculateMacd(closes, config.FastMAPeriod, config.SlowMAPeriod, 9);
             var sma5 = CalculateSma(closes, 5);
             var sma20 = CalculateSma(closes, 20);
-            var (upperBB, _, lowerBB) = CalculateBollingerBands(closes, config.BbPeriod, config.BbStdDev);
+            var (upperBB, middleBB, lowerBB) = CalculateBollingerBands(closes, config.BbPeriod, config.BbStdDev);
             var atr = (float)CalculateATR(currentWindow, 14);
             var volumeChange = (float)(volumes.Last() / volumes.Take(volumes.Length - 1).Average() - 1);
 
-            // Определение целевой переменной
+            // Расчет тренда на старшем таймфрейме
+            var higherCloses = higherTimeframeKlines
+                .Where(k => k.OpenTime <= currentWindow.Last().OpenTime)
+                .Take(config.MlLookbackPeriod / 4)
+                .Select(k => (double)k.ClosePrice)
+                .ToArray();
+
+            var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod / 4);
+            var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod / 4);
+            float higherTrend = (float)(higherFastMa - higherSlowMa);
+
+            // Расчет "рыночных настроений" (отношение цены к скользящим средним)
+            float marketSentiment = (float)((closes.Last() - sma20) / (sma20 * 0.01));
+
+            // Определение целевой переменной с улучшенной логикой
             double currentPrice = closes.Last();
             double futureMaxPrice = futurePrices.Max();
             double futureMinPrice = futurePrices.Min();
-            bool willRise = (futureMaxPrice - currentPrice) > (currentPrice - futureMinPrice);
+            double futureAvgPrice = futurePrices.Average();
+
+            // Усложненное условие: цена должна не просто вырасти, а превзойти волатильность
+            double atrValue = (double)CalculateATR(currentWindow.TakeLast(14).ToList(), 14);
+            bool willRise = (futureMaxPrice - currentPrice) > (currentPrice - futureMinPrice) &&
+                          (futureAvgPrice - currentPrice) > atrValue * 0.5;
 
             // Балансировка классов
             if (willRise && positiveCount > negativeCount * config.MlPositiveClassWeight) continue;
@@ -318,7 +354,7 @@ public class Program
             if (willRise) positiveCount++;
             else negativeCount++;
 
-            // Добавление данных
+            // Добавление данных с новыми фичами
             mlData.Add(new MarketData
             {
                 Open = (float)currentWindow.Last().OpenPrice,
@@ -335,6 +371,8 @@ public class Program
                 BBLower = (float)lowerBB,
                 ATR = atr,
                 VolumeChange = volumeChange,
+                HigherTrend = higherTrend,
+                MarketSentiment = marketSentiment,
                 Target = willRise
             });
         }
@@ -343,7 +381,65 @@ public class Program
         return mlData;
     }
 
-    // Обучение модели ML
+    // Агрегация свечей на старший таймфрейм
+    private static List<IBinanceKline> AggregateKlinesToHigherTimeframe(List<IBinanceKline> klines, KlineInterval higherTimeframe)
+    {
+        var result = new List<IBinanceKline>();
+        if (klines.Count == 0) return result;
+
+        // Определяем количество свечей младшего ТФ в старшем
+        int aggregationFactor = GetAggregationFactor(config.PrimaryTimeframe, higherTimeframe);
+        if (aggregationFactor <= 1) return klines;
+
+        for (int i = 0; i < klines.Count; i += aggregationFactor)
+        {
+            var group = klines.Skip(i).Take(aggregationFactor).ToList();
+            if (group.Count == 0) continue;
+
+            var aggregatedKline = new BinanceStreamKline()
+            {
+                OpenTime = group.First().OpenTime,
+                OpenPrice = group.First().OpenPrice,
+                HighPrice = group.Max(k => k.HighPrice),
+                LowPrice = group.Min(k => k.LowPrice),
+                ClosePrice = group.Last().ClosePrice,
+                Volume = group.Sum(k => k.Volume),
+                QuoteVolume = group.Sum(k => k.QuoteVolume),
+                TradeCount = (int)group.Sum(k => k.TradeCount),
+                TakerBuyBaseVolume = group.Sum(k => k.TakerBuyBaseVolume),
+                TakerBuyQuoteVolume = group.Sum(k => k.TakerBuyQuoteVolume),
+                Final = true
+            };
+
+            result.Add(aggregatedKline);
+        }
+
+        return result;
+    }
+
+    // Получение коэффициента агрегации между таймфреймами
+    private static int GetAggregationFactor(KlineInterval lower, KlineInterval higher)
+    {
+        var minutesMap = new Dictionary<KlineInterval, int>
+        {
+            { KlineInterval.OneMinute, 1 },
+            { KlineInterval.ThreeMinutes, 3 },
+            { KlineInterval.FiveMinutes, 5 },
+            { KlineInterval.FifteenMinutes, 15 },
+            { KlineInterval.ThirtyMinutes, 30 },
+            { KlineInterval.OneHour, 60 },
+            { KlineInterval.TwoHour, 120 },
+            { KlineInterval.FourHour, 240 },
+            { KlineInterval.OneDay, 1440 }
+        };
+
+        if (!minutesMap.ContainsKey(lower)) return 1;
+        if (!minutesMap.ContainsKey(higher)) return 1;
+
+        return minutesMap[higher] / minutesMap[lower];
+    }
+
+    // Обучение модели с улучшенным конвейером
     private static void TrainModel(List<MarketData> trainingData)
     {
         try
@@ -356,7 +452,7 @@ public class Program
 
             IDataView dataView = mlContext.Data.LoadFromEnumerable(trainingData);
 
-            // Конвейер обработки данных
+            // Конвейер обработки данных с нормализацией
             var dataProcessPipeline = mlContext.Transforms
                 .Concatenate("Features",
                     nameof(MarketData.Open),
@@ -372,24 +468,26 @@ public class Program
                     nameof(MarketData.BBUpper),
                     nameof(MarketData.BBLower),
                     nameof(MarketData.ATR),
-                    nameof(MarketData.VolumeChange))
+                    nameof(MarketData.VolumeChange),
+                    nameof(MarketData.HigherTrend),
+                    nameof(MarketData.MarketSentiment))
                 .Append(mlContext.Transforms.NormalizeMinMax("Features"));
 
-            // Выбор алгоритма обучения
+            // Выбор алгоритма обучения с оптимизированными параметрами
             var trainer = mlContext.BinaryClassification.Trainers.LightGbm(
                 labelColumnName: "Label",
                 featureColumnName: "Features",
                 numberOfLeaves: 31,
                 minimumExampleCountPerLeaf: 10,
                 learningRate: 0.05,
-                numberOfIterations: 100);
+                numberOfIterations: 200);
 
             var trainingPipeline = dataProcessPipeline.Append(trainer);
 
             // Обучение модели
             mlModel = trainingPipeline.Fit(dataView);
 
-            // Кросс-валидация
+            // Расширенная кросс-валидация
             var cvResults = mlContext.BinaryClassification.CrossValidate(
                 dataView,
                 trainingPipeline,
@@ -399,11 +497,17 @@ public class Program
             var avgAccuracy = cvResults.Average(r => r.Metrics.Accuracy);
             var avgAuc = cvResults.Average(r => r.Metrics.AreaUnderRocCurve);
             var avgF1Score = cvResults.Average(r => r.Metrics.F1Score);
+            var avgLogLoss = cvResults.Average(r => r.Metrics.LogLoss);
 
             logger.LogInformation($"Модель обучена. Средние метрики:\n" +
                                 $"Точность: {avgAccuracy:P2}\n" +
                                 $"AUC: {avgAuc:F2}\n" +
-                                $"F1-Score: {avgF1Score:F2}");
+                                $"F1-Score: {avgF1Score:F2}\n" +
+                                $"LogLoss: {avgLogLoss:F4}");
+
+            // Сохранение модели
+            mlContext.Model.Save(mlModel, dataView.Schema, "MarketPredictionModel.zip");
+            logger.LogInformation("Модель сохранена в файл MarketPredictionModel.zip");
         }
         catch (Exception ex)
         {
@@ -412,7 +516,7 @@ public class Program
         }
     }
 
-    // Оптимизация параметров
+    // Оптимизация параметров стратегии с улучшенной оценкой
     private static async Task OptimizeParameters(BinanceRestClient binanceClient, TelegramBotClient telegramBot)
     {
         logger.LogInformation("Запуск оптимизации параметров...");
@@ -424,10 +528,13 @@ public class Program
             return;
         }
 
-        // Разделение данных на обучающую и тестовую выборки
-        var splitIndex = (int)(allKlines.Count * 0.7);
-        var trainKlines = allKlines.Take(splitIndex).ToList();
-        var testKlines = allKlines.Skip(splitIndex).ToList();
+        // Разделение данных на обучающую, валидационную и тестовую выборки
+        var trainSize = (int)(allKlines.Count * 0.6);
+        var valSize = (int)(allKlines.Count * 0.2);
+
+        var trainKlines = allKlines.Take(trainSize).ToList();
+        var valKlines = allKlines.Skip(trainSize).Take(valSize).ToList();
+        var testKlines = allKlines.Skip(trainSize + valSize).ToList();
 
         logger.LogInformation("=== БАКТЕСТ ПЕРЕД ОПТИМИЗАЦИЕЙ ===");
         var defaultParams = new TradingParams(
@@ -439,14 +546,15 @@ public class Program
             config.BbPeriod,
             config.BbStdDev);
 
-        var defaultScore = EvaluateParameters(trainKlines, testKlines, defaultParams);
+        var defaultScore = EvaluateParameters(trainKlines, valKlines, testKlines, defaultParams);
         logger.LogInformation($"Результат до оптимизации: {defaultScore:F2} с параметрами: {defaultParams}");
 
         var random = new Random();
         var bestScore = double.MinValue;
         var bestParams = defaultParams;
+        var bestPopulation = new List<(double Score, TradingParams Params)>();
 
-        // Генетический алгоритм оптимизации
+        // Генетический алгоритм оптимизации с улучшенной мутацией
         for (int generation = 0; generation < config.OptimizationGenerations; generation++)
         {
             logger.LogInformation($"Поколение {generation + 1}/{config.OptimizationGenerations}");
@@ -470,29 +578,52 @@ public class Program
             }
             else
             {
-                // Последующие поколения - мутация лучших параметров
-                for (int i = 0; i < config.OptimizationPopulationSize; i++)
+                // Элитизм - сохраняем лучшие параметры из предыдущего поколения
+                int eliteCount = (int)(config.OptimizationPopulationSize * 0.2);
+                for (int i = 0; i < eliteCount; i++)
                 {
-                    population.Add(MutateParams(bestParams, random));
+                    population.Add(bestPopulation[i].Params);
+                }
+
+                // Последующие поколения - мутация лучших параметров с адаптивным размером шага
+                double mutationStrength = 1.0 - (generation / (double)config.OptimizationGenerations);
+
+                for (int i = eliteCount; i < config.OptimizationPopulationSize; i++)
+                {
+                    var parent = bestPopulation[random.Next(bestPopulation.Count / 2)].Params;
+                    population.Add(MutateParams(parent, random, mutationStrength));
                 }
             }
 
-            // Оценка каждого набора параметров
-            foreach (var paramSet in population)
+            // Параллельная оценка каждого набора параметров
+            var results = new List<(double Score, TradingParams Params)>();
+            Parallel.ForEach(population, paramSet =>
             {
-                var result = EvaluateParameters(trainKlines, testKlines, paramSet);
-
-                if (result > bestScore)
+                var result = EvaluateParameters(trainKlines, valKlines, testKlines, paramSet);
+                lock (results)
                 {
-                    bestScore = result;
-                    bestParams = paramSet;
+                    results.Add((result, paramSet));
+                }
+            });
+
+            // Сортировка результатов
+            results = results.OrderByDescending(r => r.Score).ToList();
+            bestPopulation = results;
+
+            // Выбор лучшего набора параметров
+            foreach (var result in results)
+            {
+                if (result.Score > bestScore)
+                {
+                    bestScore = result.Score;
+                    bestParams = result.Params;
                     logger.LogInformation($"Новый лучший результат: {bestScore:F2} с параметрами: {bestParams}");
                 }
             }
         }
 
         logger.LogInformation("=== БАКТЕСТ ПОСЛЕ ОПТИМИЗАЦИИ ===");
-        var optimizedScore = EvaluateParameters(trainKlines, testKlines, bestParams);
+        var optimizedScore = EvaluateParameters(trainKlines, valKlines, testKlines, bestParams);
         logger.LogInformation($"Результат после оптимизации: {optimizedScore:F2} с параметрами: {bestParams}");
 
         // Отправка результатов в Telegram
@@ -513,31 +644,42 @@ public class Program
         config.BbStdDev = bestParams.BbStdDev;
     }
 
-    // Оценка параметров
-    private static double EvaluateParameters(List<IBinanceKline> trainKlines, List<IBinanceKline> testKlines, TradingParams parameters)
+    // Оценка параметров стратегии с улучшенной метрикой
+    private static double EvaluateParameters(List<IBinanceKline> trainKlines, List<IBinanceKline> valKlines, List<IBinanceKline> testKlines, TradingParams parameters)
     {
         // Тестирование на обучающей выборке
         var trainResult = BacktestWithParams(trainKlines, parameters);
-        if (trainResult.WinRate < config.OptimizationMinWinRate)
-            return 0; // Отбрасываем параметры с низким процентом прибыльных сделок
+        if (trainResult.WinRate < config.OptimizationMinWinRate || trainResult.ProfitRatio < config.OptimizationMinProfitRatio)
+            return 0;
+
+        // Тестирование на валидационной выборке
+        var valResult = BacktestWithParams(valKlines, parameters);
+        if (valResult.WinRate < config.OptimizationMinWinRate || valResult.ProfitRatio < config.OptimizationMinProfitRatio)
+            return 0;
 
         // Тестирование на тестовой выборке
         var testResult = BacktestWithParams(testKlines, parameters);
 
-        // Комплексная оценка
-        double score = testResult.SharpeRatio * 0.6 +
-                      (testResult.ProfitRatio - 1) * 0.3 -
-                      testResult.MaxDrawdown * 0.1;
+        // Комплексная оценка с учетом стабильности
+        double stabilityFactor = 1.0 - Math.Abs(trainResult.ProfitRatio - testResult.ProfitRatio);
+        double score = testResult.SharpeRatio * config.OptimizationSharpeWeight +
+                      (testResult.ProfitRatio - 1) * config.OptimizationProfitWeight +
+                      testResult.WinRate * config.OptimizationWinRateWeight -
+                      testResult.MaxDrawdown * config.OptimizationDrawdownWeight;
+
+        score *= stabilityFactor;
 
         logger.LogDebug($"Оценка параметров {parameters}: Score={score:F2}, " +
                        $"Profit={testResult.ProfitRatio:F2}, " +
                        $"Sharpe={testResult.SharpeRatio:F2}, " +
-                       $"DD={testResult.MaxDrawdown:F2}%");
+                       $"WinRate={testResult.WinRate:F2}, " +
+                       $"DD={testResult.MaxDrawdown:F2}%, " +
+                       $"Stability={stabilityFactor:F2}");
 
         return score;
     }
 
-    // Бэктест с заданными параметрами
+    // Бэктест с заданными параметрами и улучшенной логикой
     private static BacktestResult BacktestWithParams(List<IBinanceKline> klines, TradingParams parameters)
     {
         decimal balance = config.InitialBalance;
@@ -547,19 +689,27 @@ public class Program
         int tradesCount = 0;
         int profitableTrades = 0;
         decimal totalCommission = 0;
+        decimal maxBalance = balance;
+        decimal maxDrawdown = 0;
+
+        bool trailingActive = false;
+        decimal highestPriceSinceEntry = 0;
+        decimal lowestPriceSinceEntry = 0;
 
         int requiredBars = new[] {
-            parameters.SlowMAPeriod,
-            parameters.RSIPeriod,
-            parameters.BbPeriod,
-            config.VolatilityPeriod
-        }.Max() + 1;
+        parameters.SlowMAPeriod,
+        parameters.RSIPeriod,
+        parameters.BbPeriod,
+        config.VolatilityPeriod
+    }.Max() + 1;
 
         if (klines.Count < requiredBars)
         {
             logger.LogWarning($"Недостаточно данных для оценки. Требуется: {requiredBars}, получено: {klines.Count}");
             return new BacktestResult(0, 0, 0, 0);
         }
+
+        var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(klines, config.HigherTimeframe);
 
         for (int i = requiredBars; i < klines.Count; i++)
         {
@@ -570,7 +720,7 @@ public class Program
             if (!CheckVolatilityFilter(previousKlines, i)) continue;
 
             var closePrices = previousKlines.Select(k => (double)k.ClosePrice).ToArray();
-            var currentPrice = (double)currentKline.ClosePrice;
+            var currentPrice = (decimal)currentKline.ClosePrice;
 
             var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
             var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
@@ -578,41 +728,86 @@ public class Program
             var (macdLine, signalLine, _) = CalculateMacd(closePrices, parameters.FastMAPeriod, parameters.SlowMAPeriod, 9);
             var (upperBand, _, lowerBand) = CalculateBollingerBands(closePrices, parameters.BbPeriod, parameters.BbStdDev);
 
-            // Расчет ATR с защитой от нуля
-            var atr = CalculateATR(previousKlines.Skip(i - 14).Take(14).ToList(), 14);
-            var safeAtr = atr > 0 ? atr : (decimal)currentPrice * config.MinAtrPercent;
+            var higherKlinesForTrend = higherTimeframeKlines
+                .Where(k => k.OpenTime <= currentKline.OpenTime)
+                .TakeLast(parameters.SlowMAPeriod / 2)
+                .ToList();
 
-            // Закрытие позиции
+            if (higherKlinesForTrend.Count < 5) continue;
+
+            var higherCloses = higherKlinesForTrend.Select(k => (double)k.ClosePrice).ToArray();
+            var higherFastMa = CalculateSma(higherCloses, parameters.FastMAPeriod / 2);
+            var higherSlowMa = CalculateSma(higherCloses, parameters.SlowMAPeriod / 2);
+
+            var atr = CalculateATR(previousKlines.Skip(i - 14).Take(14).ToList(), 14);
+            var safeAtr = atr > 0 ? atr : currentPrice * config.MinAtrPercent;
+
+            // ===== Закрытие позиции =====
             if (position != 0)
             {
                 bool shouldClose = false;
                 decimal exitPrice = 0;
                 string exitReason = "";
 
-                if (position > 0) // Длинная позиция
+                // Лонг
+                if (position > 0)
                 {
-                    if ((decimal)currentPrice <= entryPrice - safeAtr * config.AtrMultiplierSL)
+                    // Активация трейлинга
+                    if (!trailingActive && currentPrice >= entryPrice + safeAtr * 2)
+                    {
+                        trailingActive = true;
+                        highestPriceSinceEntry = currentPrice;
+                    }
+
+                    // Обновление пика цены
+                    if (trailingActive && currentPrice > highestPriceSinceEntry)
+                        highestPriceSinceEntry = currentPrice;
+
+                    // Проверка выхода по трейлингу
+                    if (trailingActive && currentPrice <= highestPriceSinceEntry - safeAtr * 0.5m)
+                    {
+                        exitPrice = currentPrice;
+                        exitReason = "Trailing Stop";
+                        shouldClose = true;
+                    }
+                    else if (currentPrice <= entryPrice - safeAtr * config.AtrMultiplierSL)
                     {
                         exitPrice = entryPrice - safeAtr * config.AtrMultiplierSL;
                         exitReason = "SL";
                         shouldClose = true;
                     }
-                    else if ((decimal)currentPrice >= entryPrice + safeAtr * config.AtrMultiplierTP)
+                    else if (currentPrice >= entryPrice + safeAtr * config.AtrMultiplierTP)
                     {
                         exitPrice = entryPrice + safeAtr * config.AtrMultiplierTP;
                         exitReason = "TP";
                         shouldClose = true;
                     }
                 }
-                else // Короткая позиция
+                // Шорт
+                else
                 {
-                    if ((decimal)currentPrice >= entryPrice + safeAtr * config.AtrMultiplierSL)
+                    if (!trailingActive && currentPrice <= entryPrice - safeAtr * 2)
+                    {
+                        trailingActive = true;
+                        lowestPriceSinceEntry = currentPrice;
+                    }
+
+                    if (trailingActive && currentPrice < lowestPriceSinceEntry)
+                        lowestPriceSinceEntry = currentPrice;
+
+                    if (trailingActive && currentPrice >= lowestPriceSinceEntry + safeAtr * 0.5m)
+                    {
+                        exitPrice = currentPrice;
+                        exitReason = "Trailing Stop";
+                        shouldClose = true;
+                    }
+                    else if (currentPrice >= entryPrice + safeAtr * config.AtrMultiplierSL)
                     {
                         exitPrice = entryPrice + safeAtr * config.AtrMultiplierSL;
                         exitReason = "SL";
                         shouldClose = true;
                     }
-                    else if ((decimal)currentPrice <= entryPrice - safeAtr * config.AtrMultiplierTP)
+                    else if (currentPrice <= entryPrice - safeAtr * config.AtrMultiplierTP)
                     {
                         exitPrice = entryPrice - safeAtr * config.AtrMultiplierTP;
                         exitReason = "TP";
@@ -626,14 +821,17 @@ public class Program
                         ? position * (exitPrice - entryPrice)
                         : position * (entryPrice - exitPrice);
 
-                    // Учет комиссии
-                    decimal commission = Math.Abs(position) * exitPrice * config.CommissionPercent / 100m * 2; // Вход и выход
+                    decimal commission = Math.Abs(position) * exitPrice * config.CommissionPercent / 100m;
                     totalCommission += commission;
                     pnl -= commission;
 
                     balance += pnl;
                     tradesCount++;
                     if (pnl > 0) profitableTrades++;
+
+                    if (balance > maxBalance) maxBalance = balance;
+                    decimal drawdown = (maxBalance - balance) / maxBalance * 100;
+                    if (drawdown > maxDrawdown) maxDrawdown = drawdown;
 
                     tradeHistory.Add(new TradeRecord(
                         currentKline.OpenTime,
@@ -648,54 +846,38 @@ public class Program
                         $"Закрытие по {exitReason}. ATR: {safeAtr:F2}"));
 
                     position = 0;
+                    trailingActive = false;
                     equityCurve.Add(balance);
                     continue;
                 }
             }
 
-            // Условия для входа в сделку (упрощенные)
-            bool isBullish = fastMa > slowMa &&
-                           currentPrice > fastMa &&
-                           rsi < parameters.OverboughtLevel;
+            // ===== Открытие позиции =====
+            bool isHigherTrendBullish = higherFastMa > higherSlowMa;
+            bool isHigherTrendBearish = higherFastMa < higherSlowMa;
 
-            bool isBearish = fastMa < slowMa &&
-                           currentPrice < fastMa &&
-                           rsi > parameters.OversoldLevel;
+            bool isPrimaryBullish = fastMa > slowMa &&
+                                    (double)currentPrice > fastMa &&
+                                    rsi < parameters.OverboughtLevel &&
+                                    (double)currentPrice > lowerBand;
 
-            // Вход в сделку
+            bool isPrimaryBearish = fastMa < slowMa &&
+                                    (double)currentPrice < fastMa &&
+                                    rsi > parameters.OversoldLevel &&
+                                    (double)currentPrice < upperBand;
+
+            bool isBullish = (isHigherTrendBullish || !isHigherTrendBearish) && isPrimaryBullish;
+            bool isBearish = (isHigherTrendBearish || !isHigherTrendBullish) && isPrimaryBearish;
+
             if (isBullish && position <= 0)
             {
-                if (position < 0) // Закрываем короткую позицию
-                {
-                    decimal pnl = position * ((decimal)currentPrice - entryPrice);
-                    decimal commission = Math.Abs(position) * (decimal)currentPrice * config.CommissionPercent / 100m;
-                    totalCommission += commission;
-                    pnl -= commission;
-
-                    balance += pnl;
-                    tradesCount++;
-                    if (pnl > 0) profitableTrades++;
-
-                    tradeHistory.Add(new TradeRecord(
-                        currentKline.OpenTime,
-                        "BUY (Close)",
-                        Math.Abs(position),
-                        entryPrice,
-                        (decimal)currentPrice,
-                        0, 0, pnl,
-                        commission,
-                        "Закрытие короткой позиции перед открытием длинной"));
-                }
-
-                // Расчет размера позиции с учетом риска
                 decimal quantity = (balance * config.RiskPerTrade) / (safeAtr * config.AtrMultiplierSL);
-                quantity = Math.Max(quantity, config.MinOrderSize); // Не меньше минимального ордера
-                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / (decimal)currentPrice); // Не больше максимального размера
+                quantity = Math.Max(quantity, config.MinOrderSize);
+                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / currentPrice);
 
                 position = quantity;
-                entryPrice = (decimal)currentPrice;
+                entryPrice = currentPrice;
 
-                // Учет комиссии на вход
                 decimal entryCommission = quantity * entryPrice * config.CommissionPercent / 100m;
                 totalCommission += entryCommission;
                 balance -= entryCommission;
@@ -714,37 +896,13 @@ public class Program
             }
             else if (isBearish && position >= 0)
             {
-                if (position > 0) // Закрываем длинную позицию
-                {
-                    decimal pnl = position * ((decimal)currentPrice - entryPrice);
-                    decimal commission = position * (decimal)currentPrice * config.CommissionPercent / 100m;
-                    totalCommission += commission;
-                    pnl -= commission;
-
-                    balance += pnl;
-                    tradesCount++;
-                    if (pnl > 0) profitableTrades++;
-
-                    tradeHistory.Add(new TradeRecord(
-                        currentKline.OpenTime,
-                        "SELL (Close)",
-                        position,
-                        entryPrice,
-                        (decimal)currentPrice,
-                        0, 0, pnl,
-                        commission,
-                        "Закрытие длинной позиции перед открытием короткой"));
-                }
-
-                // Расчет размера позиции с учетом риска
                 decimal quantity = (balance * config.RiskPerTrade) / (safeAtr * config.AtrMultiplierSL);
-                quantity = Math.Max(quantity, config.MinOrderSize); // Не меньше минимального ордера
-                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / (decimal)currentPrice); // Не больше максимального размера
+                quantity = Math.Max(quantity, config.MinOrderSize);
+                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / currentPrice);
 
                 position = -quantity;
-                entryPrice = (decimal)currentPrice;
+                entryPrice = currentPrice;
 
-                // Учет комиссии на вход
                 decimal entryCommission = quantity * entryPrice * config.CommissionPercent / 100m;
                 totalCommission += entryCommission;
                 balance -= entryCommission;
@@ -762,43 +920,15 @@ public class Program
                     $"Открытие короткой позиции. ATR: {safeAtr:F2}"));
             }
 
-            equityCurve.Add(balance + position * ((decimal)currentPrice - entryPrice));
+            equityCurve.Add(balance + position * (currentPrice - entryPrice));
         }
 
-        // Закрытие последней позиции
-        if (position != 0)
-        {
-            var lastPrice = (double)klines.Last().ClosePrice;
-            decimal pnl = position > 0
-                ? position * ((decimal)lastPrice - entryPrice)
-                : position * (entryPrice - (decimal)lastPrice);
-
-            decimal commission = Math.Abs(position) * (decimal)lastPrice * config.CommissionPercent / 100m;
-            totalCommission += commission;
-            pnl -= commission;
-
-            balance += pnl;
-            tradesCount++;
-            if (pnl > 0) profitableTrades++;
-
-            tradeHistory.Add(new TradeRecord(
-                klines.Last().OpenTime,
-                position > 0 ? "SELL (Close)" : "BUY (Close)",
-                Math.Abs(position),
-                entryPrice,
-                (decimal)lastPrice,
-                0, 0, pnl,
-                commission,
-                "Принудительное закрытие позиции в конце теста"));
-        }
-
-        // Расчет метрик
         double profitRatio = (double)(balance / config.InitialBalance);
         double sharpeRatio = CalculateSharpeRatio(equityCurve);
         double winRate = tradesCount > 0 ? (double)profitableTrades / tradesCount : 0;
-        double maxDrawdown = (double)CalculateMaxDrawdown(equityCurve);
+        double maxDrawdownPercent = (double)maxDrawdown;
 
-        return new BacktestResult(profitRatio, sharpeRatio, winRate, maxDrawdown);
+        return new BacktestResult(profitRatio, sharpeRatio, winRate, maxDrawdownPercent);
     }
 
     // Результаты бэктеста
@@ -808,7 +938,7 @@ public class Program
         double WinRate,
         double MaxDrawdown);
 
-    // Запуск универсального бэктеста
+    // Запуск универсального бэктеста с улучшенной логикой
     private static async Task RunBacktestUniversal(
         BinanceRestClient binanceClient,
         TelegramBotClient telegramBot,
@@ -868,6 +998,12 @@ public class Program
             int mlRejections = 0;
             decimal totalCommission = 0;
             int profitableTrades = 0;
+            decimal maxBalance = balance;
+            decimal maxDrawdown = 0;
+
+            bool trailingActive = false;
+            decimal highestPriceSinceEntry = 0;
+            decimal lowestPriceSinceEntry = 0;
 
             int requiredBars = new[] {
                 parameters.SlowMAPeriod,
@@ -886,6 +1022,9 @@ public class Program
             var predictionEngine = useMachineLearning ?
                 mlContext.Model.CreatePredictionEngine<MarketData, MarketPrediction>(mlModel) : null;
 
+            // Получаем данные старшего таймфрейма для анализа тренда
+            var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(allKlines, config.HigherTimeframe);
+
             logger.LogInformation("Начало обработки данных...");
             for (int i = requiredBars; i < allKlines.Count; i++)
             {
@@ -898,23 +1037,51 @@ public class Program
                 var atr = CalculateATR(previousKlines.Skip(i - 20).Take(20).ToList(), 20);
                 var safeAtr = atr > 0 ? atr : (decimal)currentPrice * config.MinAtrPercent;
 
+
+
+
+
+
+
+
+                // Расчет индикаторов для основного таймфрейма
                 var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
                 var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
                 var rsi = CalculateRsi(closePrices, parameters.RSIPeriod);
                 var (macdLine, signalLine, _) = CalculateMacd(closePrices, parameters.FastMAPeriod, parameters.SlowMAPeriod, 9);
                 var (upperBand, middleBand, lowerBand) = CalculateBollingerBands(closePrices, parameters.BbPeriod, parameters.BbStdDev);
 
-                // Упрощенные условия для входа
-                bool isBullish = fastMa > slowMa &&
-                               currentPrice > fastMa &&
-                               rsi < parameters.OverboughtLevel;
+                // Расчет индикаторов для старшего таймфрейма
+                var higherKlinesForTrend = higherTimeframeKlines
+                    .Where(k => k.OpenTime <= currentKline.OpenTime)
+                    .TakeLast(parameters.SlowMAPeriod / 2)
+                    .ToList();
 
-                bool isBearish = fastMa < slowMa &&
-                               currentPrice < fastMa &&
-                               rsi > parameters.OversoldLevel;
+                if (higherKlinesForTrend.Count < 5) continue;
+
+                var higherCloses = higherKlinesForTrend.Select(k => (double)k.ClosePrice).ToArray();
+                var higherFastMa = CalculateSma(higherCloses, parameters.FastMAPeriod / 2);
+                var higherSlowMa = CalculateSma(higherCloses, parameters.SlowMAPeriod / 2);
+
+                // Определение тренда на старшем таймфрейме
+                bool isHigherTrendBullish = higherFastMa > higherSlowMa;
+                bool isHigherTrendBearish = higherFastMa < higherSlowMa;
+
+                // Упрощенные условия для входа с дополнительными фильтрами
+                bool isPrimaryBullish = fastMa > slowMa &&
+                                      currentPrice > fastMa &&
+                                      rsi < parameters.OverboughtLevel &&
+                                      currentPrice > lowerBand &&
+                                      macdLine > signalLine;
+
+                bool isPrimaryBearish = fastMa < slowMa &&
+                                      currentPrice < fastMa &&
+                                      rsi > parameters.OversoldLevel &&
+                                      currentPrice < upperBand &&
+                                      macdLine < signalLine;
 
                 bool mlConfirmation = true;
-                if (useMachineLearning && predictionEngine != null && (isBullish || isBearish) && i >= config.MlLookbackPeriod)
+                if (useMachineLearning && predictionEngine != null && (isPrimaryBullish || isPrimaryBearish))
                 {
                     var mlInput = new MarketData
                     {
@@ -931,35 +1098,49 @@ public class Program
                         BBUpper = (float)upperBand,
                         BBLower = (float)lowerBand,
                         ATR = (float)safeAtr,
-                        VolumeChange = (float)(currentKline.Volume / previousKlines.Average(k => k.Volume) - 1)
+                        VolumeChange = (float)(currentKline.Volume / previousKlines.Average(k => k.Volume) - 1),
+                        HigherTrend = (float)(higherFastMa - higherSlowMa),
+                        MarketSentiment = (float)((currentPrice - middleBand) / (middleBand * 0.01))
                     };
 
                     var prediction = predictionEngine.Predict(mlInput);
                     mlConfirmation = prediction.ConfirmedPrediction;
 
-                    if (isBullish || isBearish)
+                    if (isPrimaryBullish || isPrimaryBearish)
                     {
                         if (mlConfirmation)
                         {
                             mlConfirmations++;
-                            logger.LogDebug($"ML подтвердил сигнал: {(isBullish ? "BUY" : "SELL")} (Score: {prediction.Score:P2})");
+                            logger.LogDebug($"ML подтвердил сигнал: {(isPrimaryBullish ? "BUY" : "SELL")} (Score: {prediction.Score:P2})");
                         }
                         else
                         {
                             mlRejections++;
-                            logger.LogDebug($"ML отклонил сигнал: {(isBullish ? "BUY" : "SELL")} (Score: {prediction.Score:P2})");
+                            logger.LogDebug($"ML отклонил сигнал: {(isPrimaryBullish ? "BUY" : "SELL")} (Score: {prediction.Score:P2})");
                         }
                     }
                 }
 
-                // Закрытие позиции
+                // Комбинированные условия с учетом тренда и ML
+                bool isBullish = (isHigherTrendBullish || !isHigherTrendBearish) && isPrimaryBullish && (!useMachineLearning || mlConfirmation);
+                bool isBearish = (isHigherTrendBearish || !isHigherTrendBullish) && isPrimaryBearish && (!useMachineLearning || mlConfirmation);
+
+                // Закрытие позиции по условиям
                 if (position != 0)
                 {
                     bool shouldClose = false;
                     decimal exitPrice = 0;
                     string exitReason = "";
 
-                    if (position > 0) // Длинная позиция
+                    // Проверка времени удержания позиции
+                    var holdTime = currentKline.OpenTime - tradeHistory.Last().Timestamp;
+                    if (holdTime.TotalHours >= 24)
+                    {
+                        exitPrice = (decimal)currentPrice;
+                        exitReason = "Time Exit";
+                        shouldClose = true;
+                    }
+                    else if (position > 0) // Длинная позиция
                     {
                         if ((decimal)currentPrice <= entryPrice - safeAtr * config.AtrMultiplierSL)
                         {
@@ -971,6 +1152,14 @@ public class Program
                         {
                             exitPrice = entryPrice + safeAtr * config.AtrMultiplierTP;
                             exitReason = "TP";
+                            shouldClose = true;
+                        }
+                        // Трейлинг-стоп
+                        else if ((decimal)currentPrice >= entryPrice + safeAtr * 2 &&
+                                (decimal)currentPrice <= entryPrice + safeAtr * 2 - safeAtr * 0.5m)
+                        {
+                            exitPrice = (decimal)currentPrice;
+                            exitReason = "Trailing Stop";
                             shouldClose = true;
                         }
                     }
@@ -988,6 +1177,14 @@ public class Program
                             exitReason = "TP";
                             shouldClose = true;
                         }
+                        // Трейлинг-стоп
+                        else if ((decimal)currentPrice <= entryPrice - safeAtr * 2 &&
+                                (decimal)currentPrice >= entryPrice - safeAtr * 2 + safeAtr * 0.5m)
+                        {
+                            exitPrice = (decimal)currentPrice;
+                            exitReason = "Trailing Stop";
+                            shouldClose = true;
+                        }
                     }
 
                     if (shouldClose)
@@ -1003,6 +1200,12 @@ public class Program
 
                         balance += pnl;
                         tradesExecuted++;
+                        if (pnl > 0) profitableTrades++;
+
+                        // Обновление максимальной просадки
+                        if (balance > maxBalance) maxBalance = balance;
+                        decimal drawdown = (maxBalance - balance) / maxBalance * 100;
+                        if (drawdown > maxDrawdown) maxDrawdown = drawdown;
 
                         tradeHistory.Add(new TradeRecord(
                             currentKline.OpenTime,
@@ -1023,7 +1226,7 @@ public class Program
                 }
 
                 // Открытие новой позиции
-                if (isBullish && position <= 0 && (!useMachineLearning || mlConfirmation))
+                if (isBullish && position <= 0)
                 {
                     signalsGenerated++;
 
@@ -1036,6 +1239,7 @@ public class Program
 
                         balance += pnl;
                         tradesExecuted++;
+                        if (pnl > 0) profitableTrades++;
 
                         tradeHistory.Add(new TradeRecord(
                             currentKline.OpenTime,
@@ -1073,7 +1277,7 @@ public class Program
                         entryCommission,
                         $"Открытие длинной позиции. ATR: {safeAtr:F2}"));
                 }
-                else if (isBearish && position >= 0 && (!useMachineLearning || !mlConfirmation))
+                else if (isBearish && position >= 0)
                 {
                     signalsGenerated++;
 
@@ -1086,6 +1290,7 @@ public class Program
 
                         balance += pnl;
                         tradesExecuted++;
+                        if (pnl > 0) profitableTrades++;
 
                         tradeHistory.Add(new TradeRecord(
                             currentKline.OpenTime,
@@ -1160,8 +1365,8 @@ public class Program
             int totalTrades = tradeHistory.Count(t => t.IsClosed);
             decimal winRate = totalTrades > 0 ?
                 tradeHistory.Count(t => t.IsClosed && t.PnL > 0) * 100m / totalTrades : 0;
-            decimal maxDrawdown = CalculateMaxDrawdown(equityCurve);
             decimal sharpeRatio = (decimal)CalculateSharpeRatio(equityCurve);
+            decimal maxDrawdownPercent = (decimal)CalculateMaxDrawdown(equityCurve);
 
             logger.LogInformation("\n=== РЕЗУЛЬТАТЫ БЭКТЕСТА ===");
             logger.LogInformation($"Сигналов сгенерировано: {signalsGenerated}");
@@ -1175,7 +1380,7 @@ public class Program
             logger.LogInformation($"Прибыль: {profit:F2} ({profitPercentage:F2}%)");
             logger.LogInformation($"Комиссии: {totalCommission:F2}");
             logger.LogInformation($"Процент прибыльных сделок: {winRate:F2}%");
-            logger.LogInformation($"Максимальная просадка: {maxDrawdown:F2}%");
+            logger.LogInformation($"Максимальная просадка: {maxDrawdownPercent:F2}%");
             logger.LogInformation($"Коэффициент Шарпа: {sharpeRatio:F2}");
 
             // Отправка результатов в Telegram
@@ -1187,7 +1392,7 @@ public class Program
             message.AppendLine($"Прибыль: {profit:F2} ({profitPercentage:F2}%)");
             message.AppendLine($"Комиссии: {totalCommission:F2}");
             message.AppendLine($"Сделок: {totalTrades} | Прибыльных: {winRate:F2}%");
-            message.AppendLine($"Просадка: {maxDrawdown:F2}%");
+            message.AppendLine($"Просадка: {maxDrawdownPercent:F2}%");
             message.AppendLine($"Шарп: {sharpeRatio:F2}");
 
             if (useMachineLearning)
@@ -1208,37 +1413,69 @@ public class Program
         }
     }
 
-    // Режим реальной торговли
+    // Режим реальной торговли с улучшенной логикой
     private static async Task RunLiveTrading(BinanceRestClient binanceClient, TelegramBotClient telegramBot)
     {
         logger.LogInformation("Запуск режима реальной торговли...");
 
-        while (true)
+        // Инициализация состояния трейлинг-стопа
+        var trailingStopState = new TrailingStopState
         {
-            try
-            {
-                // Проверка необходимости переобучения модели
-                if (config.UseMachineLearning &&
-                    (DateTime.Now - lastModelTrainingTime).TotalHours >= config.MlTrainingIntervalHours)
-                {
-                    logger.LogInformation("Переобучение модели ML...");
-                    await TrainInitialModel(binanceClient);
-                }
+            ActivationPrice = 0,
+            StopLevel = 0,
+            IsActive = false
+        };
 
-                await CheckMarketAndTradeAsync(binanceClient, telegramBot);
-                await Task.Delay(TimeSpan.FromMinutes(config.CheckIntervalMinutes));
-            }
-            catch (Exception ex)
+        try
+        {
+            // Проверка необходимости переобучения модели
+            if (config.UseMachineLearning &&
+                (DateTime.Now - lastModelTrainingTime).TotalHours >= config.MlTrainingIntervalHours)
             {
-                logger.LogError(ex, "Ошибка в основном цикле торговли");
-                await telegramBot.SendMessage(config.TelegramChatId, $"⚠️ Ошибка в торговом цикле: {ex.Message}");
-                await Task.Delay(TimeSpan.FromSeconds(30));
+                logger.LogInformation("Переобучение модели ML...");
+                await TrainInitialModel(binanceClient);
             }
+
+            while (true)
+            {
+                try
+                {
+                    await CheckMarketAndTradeAsync(binanceClient, telegramBot, trailingStopState);
+                    await Task.Delay(TimeSpan.FromMinutes(config.CheckIntervalMinutes));
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Ошибка в торговом цикле");
+                    await telegramBot.SendMessage(config.TelegramChatId, $"⚠️ Ошибка в торговом цикле: {ex.Message}");
+                    await Task.Delay(TimeSpan.FromSeconds(30));
+                    trailingStopState.IsActive = false;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(ex, "Критическая ошибка в основном цикле торговли");
+            await telegramBot.SendMessage(config.TelegramChatId, $"❌ Критическая ошибка: {ex.Message}");
+        }
+        finally
+        {
+            logger.LogInformation("Режим реальной торговли остановлен");
         }
     }
 
-    // Проверка рынка и выполнение сделок
-    private static async Task CheckMarketAndTradeAsync(BinanceRestClient binanceClient, TelegramBotClient telegramBot)
+    // Состояние трейлинг-стопа
+    private class TrailingStopState
+    {
+        public decimal ActivationPrice { get; set; }
+        public decimal StopLevel { get; set; }
+        public bool IsActive { get; set; }
+    }
+
+    // Проверка рынка и выполнение сделок с трейлинг-стопом
+    private static async Task CheckMarketAndTradeAsync(
+        BinanceRestClient binanceClient,
+        TelegramBotClient telegramBot,
+        TrailingStopState trailingStopState)
     {
         if (DateTime.Now.Date != lastTradeDate.Date)
         {
@@ -1293,8 +1530,8 @@ public class Program
 
         // Расчет индикаторов для младшего таймфрейма
         var lowerCloses = lowerKlines.Select(k => (double)k.ClosePrice).ToArray();
-        var lowerFastMa = CalculateSma(lowerCloses, config.FastMAPeriod / 2);
-        var lowerSlowMa = CalculateSma(lowerCloses, config.SlowMAPeriod / 2);
+        var lowerFastMa = CalculateSma(lowerCloses, config.FastEmaPeriod / 2);
+        var lowerSlowMa = CalculateSma(lowerCloses, config.SlowEmaPeriod / 2);
         var lowerRsi = CalculateRsi(lowerCloses, config.RSIPeriod / 2);
         var (lowerMacdLine, lowerSignalLine, _) = CalculateMacd(lowerCloses, config.FastEmaPeriod / 2, config.SlowEmaPeriod / 2, config.SignalPeriod / 2);
         var (lowerUpperBb, lowerMiddleBb, lowerLowerBb) = CalculateBollingerBands(lowerCloses, config.BbPeriod / 2, config.BbStdDev);
@@ -1333,14 +1570,18 @@ public class Program
         bool isHigherTrendBullish = higherFastMa > higherSlowMa;
         bool isHigherTrendBearish = higherFastMa < higherSlowMa;
 
-        // Упрощенные условия для входа
+        // Улучшенные условия для входа с дополнительными фильтрами
         bool isPrimaryBullish = primaryFastMa > primarySlowMa &&
                               currentPrice > (decimal)primaryFastMa &&
-                              primaryRsi < config.OverboughtLevel;
+                              primaryRsi < config.OverboughtLevel &&
+                              currentPrice > (decimal)primaryLowerBb &&
+                              primaryMacdLine > primarySignalLine;
 
         bool isPrimaryBearish = primaryFastMa < primarySlowMa &&
                               currentPrice < (decimal)primaryFastMa &&
-                              primaryRsi > config.OversoldLevel;
+                              primaryRsi > config.OversoldLevel &&
+                              currentPrice < (decimal)primaryUpperBb &&
+                              primaryMacdLine < primarySignalLine;
 
         // Проверка ML подтверждения
         bool mlConfirmation = true;
@@ -1354,22 +1595,150 @@ public class Program
             }
         }
 
-        // Комбинированные условия с учетом тренда
-        bool isBullish = (isHigherTrendBullish || !isHigherTrendBearish) && isPrimaryBullish && mlConfirmation;
-        bool isBearish = (isHigherTrendBearish || !isHigherTrendBullish) && isPrimaryBearish && !mlConfirmation;
+        // Комбинированные условия с учетом тренда и ML
+        bool isBullish = (isHigherTrendBullish || !isHigherTrendBearish) && isPrimaryBullish && (!config.UseMachineLearning || mlConfirmation);
+        bool isBearish = (isHigherTrendBearish || !isHigherTrendBullish) && isPrimaryBearish && (!config.UseMachineLearning || mlConfirmation);
 
-        // Выполнение сделки
-        if (isBullish)
+        // Проверка открытых позиций
+        var positions = await GetOpenPositions(binanceClient);
+        var currentPosition = positions.FirstOrDefault();
+
+        // Управление трейлинг-стопом
+        if (currentPosition != null)
         {
-            await ExecuteTradeAsync(binanceClient, telegramBot, OrderSide.Buy, currentPrice, safeAtr);
+            if (currentPosition.Side == PositionSide.Long)
+            {
+                // Активация трейлинг-стопа для длинной позиции
+                if (!trailingStopState.IsActive && currentPrice >= currentPosition.EntryPrice + safeAtr * 2)
+                {
+                    trailingStopState.ActivationPrice = currentPrice;
+                    trailingStopState.StopLevel = trailingStopState.ActivationPrice - safeAtr;
+                    trailingStopState.IsActive = true;
+                    logger.LogInformation($"Активирован трейлинг-стоп для длинной позиции. Уровень: {trailingStopState.StopLevel:F2}");
+                }
+
+                // Проверка трейлинг-стопа
+                if (trailingStopState.IsActive)
+                {
+                    if (currentPrice > trailingStopState.ActivationPrice)
+                    {
+                        trailingStopState.ActivationPrice = currentPrice;
+                        trailingStopState.StopLevel = trailingStopState.ActivationPrice - safeAtr;
+                    }
+
+                    if (currentPrice <= trailingStopState.StopLevel)
+                    {
+                        logger.LogInformation("Сработал трейлинг-стоп для длинной позиции");
+                        await ClosePosition(binanceClient, telegramBot, currentPosition, currentPrice, "Trailing Stop");
+                        trailingStopState.IsActive = false;
+                        return;
+                    }
+                }
+            }
+            else // Короткая позиция
+            {
+                // Активация трейлинг-стопа для короткой позиции
+                if (!trailingStopState.IsActive && currentPrice <= currentPosition.EntryPrice - safeAtr * 2)
+                {
+                    trailingStopState.ActivationPrice = currentPrice;
+                    trailingStopState.StopLevel = trailingStopState.ActivationPrice + safeAtr;
+                    trailingStopState.IsActive = true;
+                    logger.LogInformation($"Активирован трейлинг-стоп для короткой позиции. Уровень: {trailingStopState.StopLevel:F2}");
+                }
+
+                // Проверка трейлинг-стопа
+                if (trailingStopState.IsActive)
+                {
+                    if (currentPrice < trailingStopState.ActivationPrice)
+                    {
+                        trailingStopState.ActivationPrice = currentPrice;
+                        trailingStopState.StopLevel = trailingStopState.ActivationPrice + safeAtr;
+                    }
+
+                    if (currentPrice >= trailingStopState.StopLevel)
+                    {
+                        logger.LogInformation("Сработал трейлинг-стоп для короткой позиции");
+                        await ClosePosition(binanceClient, telegramBot, currentPosition, currentPrice, "Trailing Stop");
+                        trailingStopState.IsActive = false;
+                        return;
+                    }
+                }
+            }
+
+            // Проверка времени удержания позиции (макс 24 часа)
+            var lastTrade = tradeHistory.LastOrDefault();
+            if (lastTrade != null && (DateTime.Now - lastTrade.Timestamp).TotalHours >= 24)
+            {
+                logger.LogInformation("Закрытие позиции по истечении времени");
+                await ClosePosition(binanceClient, telegramBot, currentPosition, currentPrice, "Time Exit");
+                return;
+            }
         }
-        else if (isBearish)
+
+        // Выполнение сделки, если нет открытых позиций
+        if (currentPosition == null)
         {
-            await ExecuteTradeAsync(binanceClient, telegramBot, OrderSide.Sell, currentPrice, safeAtr);
+            if (isBullish)
+            {
+                await ExecuteTradeAsync(binanceClient, telegramBot, OrderSide.Buy, currentPrice, safeAtr);
+            }
+            else if (isBearish)
+            {
+                await ExecuteTradeAsync(binanceClient, telegramBot, OrderSide.Sell, currentPrice, safeAtr);
+            }
         }
     }
 
-    // Выполнение сделки
+    // Закрытие позиции
+    private static async Task ClosePosition(
+        BinanceRestClient binanceClient,
+        TelegramBotClient telegramBot,
+        BinancePosition position,
+        decimal currentPrice,
+        string reason)
+    {
+        var orderSide = position.Side == PositionSide.Long ? OrderSide.Sell : OrderSide.Buy;
+
+        var order = await binanceClient.SpotApi.Trading.PlaceOrderAsync(
+            config.Symbol,
+            orderSide,
+            SpotOrderType.Market,
+            quantity: Math.Abs(position.PositionAmount));
+
+        if (order.Success)
+        {
+            decimal pnl = position.Side == PositionSide.Long
+                ? position.PositionAmount * (currentPrice - position.EntryPrice)
+                : position.PositionAmount * (position.EntryPrice - currentPrice);
+
+            decimal commission = position.PositionAmount * currentPrice * config.CommissionPercent / 100m;
+            dailyPnL += pnl - commission;
+
+            var message = $"{(orderSide == OrderSide.Sell ? "🔴 ПРОДАНО" : "🟢 КУПЛЕНО")} {Math.Abs(position.PositionAmount):0.000000} {config.Symbol} по {currentPrice:0.00}\n" +
+                          $"Причина: {reason}\n" +
+                          $"Прибыль: {pnl:0.00} | Комиссия: {commission:0.00}";
+
+            logger.LogInformation(message);
+            await telegramBot.SendMessage(config.TelegramChatId, message);
+
+            tradeHistory.Add(new TradeRecord(
+                DateTime.Now,
+                orderSide == OrderSide.Sell ? "SELL" : "BUY",
+                Math.Abs(position.PositionAmount),
+                position.EntryPrice,
+                currentPrice,
+                0, 0, pnl - commission,
+                commission,
+                $"Закрытие позиции. Причина: {reason}"));
+        }
+        else
+        {
+            logger.LogError("Ошибка закрытия позиции: {Error}", order.Error);
+            await telegramBot.SendMessage(config.TelegramChatId, $"❌ Ошибка закрытия позиции: {order.Error}");
+        }
+    }
+
+    // Выполнение сделки с улучшенным управлением рисками
     private static async Task ExecuteTradeAsync(BinanceRestClient binanceClient, TelegramBotClient telegramBot, OrderSide side, decimal currentPrice, decimal atr)
     {
         if (DateTime.Now.Date != lastTradeDate.Date)
@@ -1418,9 +1787,9 @@ public class Program
         // Расчет объема позиции с учетом риска и ограничений
         decimal safeAtr = atr > 0 ? atr : currentPrice * config.MinAtrPercent;
         decimal quantity = (usdtBalance.Value * config.RiskPerTrade) / (safeAtr * config.AtrMultiplierSL);
-        quantity = Math.Round(quantity, 6); // Округление до 6 знаков
-        quantity = Math.Max(quantity, config.MinOrderSize); // Не меньше минимального ордера
-        quantity = Math.Min(quantity, usdtBalance.Value * config.MaxPositionSizePercent / currentPrice); // Не больше максимального размера
+        quantity = Math.Round(quantity, 6);
+        quantity = Math.Max(quantity, config.MinOrderSize);
+        quantity = Math.Min(quantity, usdtBalance.Value * config.MaxPositionSizePercent / currentPrice);
 
         if (quantity <= config.MinOrderSize)
         {
@@ -1447,7 +1816,7 @@ public class Program
 
             // Расчет комиссии
             decimal commission = quantity * currentPrice * config.CommissionPercent / 100m;
-            dailyPnL -= commission; // Учет комиссии в дневном PnL
+            dailyPnL -= commission;
 
             var message = $"{(side == OrderSide.Buy ? "🟢 КУПЛЕНО" : "🔴 ПРОДАНО")} {quantity:0.000000} {config.Symbol} по {currentPrice:0.00}\n" +
                           $"ATR: {safeAtr:0.00}, SL: {stopLossPrice:0.00}, TP: {takeProfitPrice:0.00}\n" +
@@ -1468,6 +1837,16 @@ public class Program
                 -commission,
                 commission,
                 $"Открытие позиции. ATR: {safeAtr:F2}"));
+
+            // Добавление позиции в список открытых
+            positions.Add(new BinancePosition
+            {
+                Symbol = config.Symbol,
+                PositionAmount = side == OrderSide.Buy ? quantity : -quantity,
+                EntryPrice = currentPrice,
+                MarkPrice = currentPrice,
+                Side = side == OrderSide.Buy ? PositionSide.Long : PositionSide.Short
+            });
         }
         else
         {
@@ -1503,11 +1882,15 @@ public class Program
                 return result;
             }
 
+            // Поиск цены входа в позицию в истории сделок
+            var lastTrade = tradeHistory.LastOrDefault(t => t.Type.StartsWith("BUY") && !t.IsClosed);
+            decimal entryPrice = lastTrade?.EntryPrice ?? 0;
+
             result.Add(new BinancePosition
             {
                 Symbol = config.Symbol,
                 PositionAmount = baseBalance.Value,
-                EntryPrice = 0,
+                EntryPrice = entryPrice,
                 MarkPrice = ticker.Data.Price,
                 Side = PositionSide.Long
             });
@@ -1678,15 +2061,32 @@ public class Program
                 return true;
             }
 
+            // Получаем данные старшего таймфрейма для анализа тренда
+            var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(recentKlines, config.HigherTimeframe);
+
             var closes = recentKlines.Select(k => (double)k.ClosePrice).ToArray();
             var volumes = recentKlines.Select(k => (double)k.Volume).ToArray();
             var rsi = CalculateRsi(closes, config.RSIPeriod);
             var (macdLine, signalLine, _) = CalculateMacd(closes, config.FastMAPeriod, config.SlowMAPeriod, 9);
             var sma5 = CalculateSma(closes, 5);
             var sma20 = CalculateSma(closes, 20);
-            var (upperBB, _, lowerBB) = CalculateBollingerBands(closes, config.BbPeriod, config.BbStdDev);
+            var (upperBB, middleBB, lowerBB) = CalculateBollingerBands(closes, config.BbPeriod, config.BbStdDev);
             var atr = (float)CalculateATR(recentKlines.TakeLast(14).ToList(), 14);
             var volumeChange = (float)(volumes.Last() / volumes.Take(volumes.Length - 1).Average() - 1);
+
+            // Расчет тренда на старшем таймфрейме
+            var higherCloses = higherTimeframeKlines
+                .Where(k => k.OpenTime <= recentKlines.Last().OpenTime)
+                .TakeLast(config.MlLookbackPeriod / 4)
+                .Select(k => (double)k.ClosePrice)
+                .ToArray();
+
+            var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod / 4);
+            var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod / 4);
+            float higherTrend = (float)(higherFastMa - higherSlowMa);
+
+            // Расчет рыночных настроений
+            float marketSentiment = (float)((closes.Last() - middleBB) / (middleBB * 0.01));
 
             var predictionData = new MarketData
             {
@@ -1704,6 +2104,8 @@ public class Program
                 BBLower = (float)lowerBB,
                 ATR = atr,
                 VolumeChange = volumeChange,
+                HigherTrend = higherTrend,
+                MarketSentiment = marketSentiment,
                 Target = false
             };
 
@@ -1933,23 +2335,23 @@ public class Program
         return maxDrawdown;
     }
 
-    // Мутация параметров для оптимизации
-    private static TradingParams MutateParams(TradingParams bestParams, Random random)
+    // Мутация параметров для оптимизации с адаптивным шагом
+    private static TradingParams MutateParams(TradingParams bestParams, Random random, double mutationStrength)
     {
         return new TradingParams(
-            MutateValue(bestParams.FastMAPeriod, config.FastMAPeriodRange[0], config.FastMAPeriodRange[1], random),
-            MutateValue(bestParams.SlowMAPeriod, config.SlowMAPeriodRange[0], config.SlowMAPeriodRange[1], random),
-            MutateValue(bestParams.RSIPeriod, config.RSIPeriodRange[0], config.RSIPeriodRange[1], random),
-            MutateValue(bestParams.OverboughtLevel, config.OverboughtLevelRange[0], config.OverboughtLevelRange[1], random),
-            MutateValue(bestParams.OversoldLevel, config.OversoldLevelRange[0], config.OversoldLevelRange[1], random),
-            MutateValue(bestParams.BbPeriod, 10, 30, random),
-            Math.Max(1.0, Math.Min(3.0, bestParams.BbStdDev + (random.NextDouble() - 0.5) * 0.5)));
+            MutateValue(bestParams.FastMAPeriod, config.FastMAPeriodRange[0], config.FastMAPeriodRange[1], random, mutationStrength),
+            MutateValue(bestParams.SlowMAPeriod, config.SlowMAPeriodRange[0], config.SlowMAPeriodRange[1], random, mutationStrength),
+            MutateValue(bestParams.RSIPeriod, config.RSIPeriodRange[0], config.RSIPeriodRange[1], random, mutationStrength),
+            MutateValue(bestParams.OverboughtLevel, config.OverboughtLevelRange[0], config.OverboughtLevelRange[1], random, mutationStrength),
+            MutateValue(bestParams.OversoldLevel, config.OversoldLevelRange[0], config.OversoldLevelRange[1], random, mutationStrength),
+            MutateValue(bestParams.BbPeriod, 10, 30, random, mutationStrength),
+            Math.Max(1.0, Math.Min(3.0, bestParams.BbStdDev + (random.NextDouble() - 0.5) * 0.5 * mutationStrength)));
     }
 
-    // Мутация значения параметра
-    private static T MutateValue<T>(T value, T min, T max, Random random) where T : struct
+    // Мутация значения параметра с учетом силы мутации
+    private static T MutateValue<T>(T value, T min, T max, Random random, double mutationStrength) where T : struct
     {
-        if (random.NextDouble() >= 0.3)
+        if (random.NextDouble() >= 0.3 * mutationStrength)
             return value;
 
         if (typeof(T) == typeof(int))
@@ -1957,7 +2359,7 @@ public class Program
             int val = (int)(object)value;
             int minVal = (int)(object)min;
             int maxVal = (int)(object)max;
-            int change = random.Next(-3, 4);
+            int change = random.Next(-1, 2) * (int)Math.Ceiling(mutationStrength * 2);
             int newValue = val + change;
             return (T)(object)Math.Min(maxVal, Math.Max(minVal, newValue));
         }
@@ -1966,7 +2368,7 @@ public class Program
             double val = (double)(object)value;
             double minVal = (double)(object)min;
             double maxVal = (double)(object)max;
-            double change = (random.NextDouble() - 0.5) * (maxVal - minVal) * 0.2;
+            double change = (random.NextDouble() - 0.5) * (maxVal - minVal) * 0.1 * mutationStrength;
             double newValue = val + change;
             return (T)(object)Math.Min(maxVal, Math.Max(minVal, newValue));
         }
