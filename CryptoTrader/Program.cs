@@ -299,7 +299,7 @@ public class Program
 
         int positiveCount = 0;
         int negativeCount = 0;
-
+        
         // Получаем данные старшего таймфрейма для анализа тренда
         var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(klines, config.HigherTimeframe);
 
@@ -325,18 +325,18 @@ public class Program
             // Расчет тренда на старшем таймфрейме
             var higherCloses = higherTimeframeKlines
                 .Where(k => k.OpenTime <= currentWindow.Last().OpenTime)
-                .Take(config.MlLookbackPeriod / 4)
+                .Take(config.MlLookbackPeriod / GetAggregationFactor(config.PrimaryTimeframe, config.HigherTimeframe))
                 .Select(k => (double)k.ClosePrice)
                 .ToArray();
 
-            var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod / 4);
-            var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod / 4);
+            var higherFastMa = CalculateSma(higherCloses, config.FastMAPeriod);
+            var higherSlowMa = CalculateSma(higherCloses, config.SlowMAPeriod);
             float higherTrend = (float)(higherFastMa - higherSlowMa);
 
             // Расчет "рыночных настроений" (отношение цены к скользящим средним)
             float marketSentiment = (float)((closes.Last() - sma20) / (sma20 * 0.01));
 
-            // Определение целевой переменной с улучшенной логикой
+            // Определение целевой переменной
             double currentPrice = closes.Last();
             double futureMaxPrice = futurePrices.Max();
             double futureMinPrice = futurePrices.Min();
@@ -603,6 +603,7 @@ public class Program
                 lock (results)
                 {
                     results.Add((result, paramSet));
+                    logger.LogDebug($"Оценка параметров {paramSet}: {result:F2}");
                 }
             });
 
@@ -692,16 +693,12 @@ public class Program
         decimal maxBalance = balance;
         decimal maxDrawdown = 0;
 
-        bool trailingActive = false;
-        decimal highestPriceSinceEntry = 0;
-        decimal lowestPriceSinceEntry = 0;
-
         int requiredBars = new[] {
-        parameters.SlowMAPeriod,
-        parameters.RSIPeriod,
-        parameters.BbPeriod,
-        config.VolatilityPeriod
-    }.Max() + 1;
+            parameters.SlowMAPeriod,
+            parameters.RSIPeriod,
+            parameters.BbPeriod,
+            config.VolatilityPeriod
+        }.Max() + 1;
 
         if (klines.Count < requiredBars)
         {
@@ -709,6 +706,7 @@ public class Program
             return new BacktestResult(0, 0, 0, 0);
         }
 
+        // Получаем данные старшего таймфрейма для фильтрации по тренду
         var higherTimeframeKlines = AggregateKlinesToHigherTimeframe(klines, config.HigherTimeframe);
 
         for (int i = requiredBars; i < klines.Count; i++)
@@ -720,14 +718,16 @@ public class Program
             if (!CheckVolatilityFilter(previousKlines, i)) continue;
 
             var closePrices = previousKlines.Select(k => (double)k.ClosePrice).ToArray();
-            var currentPrice = (decimal)currentKline.ClosePrice;
+            var currentPrice = (double)currentKline.ClosePrice;
 
+            // Расчет индикаторов для основного таймфрейма
             var fastMa = CalculateSma(closePrices, parameters.FastMAPeriod);
             var slowMa = CalculateSma(closePrices, parameters.SlowMAPeriod);
             var rsi = CalculateRsi(closePrices, parameters.RSIPeriod);
             var (macdLine, signalLine, _) = CalculateMacd(closePrices, parameters.FastMAPeriod, parameters.SlowMAPeriod, 9);
-            var (upperBand, _, lowerBand) = CalculateBollingerBands(closePrices, parameters.BbPeriod, parameters.BbStdDev);
+            var (upperBand, middleBand, lowerBand) = CalculateBollingerBands(closePrices, parameters.BbPeriod, parameters.BbStdDev);
 
+            // Расчет индикаторов для старшего таймфрейма
             var higherKlinesForTrend = higherTimeframeKlines
                 .Where(k => k.OpenTime <= currentKline.OpenTime)
                 .TakeLast(parameters.SlowMAPeriod / 2)
@@ -739,78 +739,68 @@ public class Program
             var higherFastMa = CalculateSma(higherCloses, parameters.FastMAPeriod / 2);
             var higherSlowMa = CalculateSma(higherCloses, parameters.SlowMAPeriod / 2);
 
+            // Расчет ATR с защитой от нуля
             var atr = CalculateATR(previousKlines.Skip(i - 14).Take(14).ToList(), 14);
-            var safeAtr = atr > 0 ? atr : currentPrice * config.MinAtrPercent;
+            var safeAtr = atr > 0 ? atr : (decimal)currentPrice * config.MinAtrPercent;
 
-            // ===== Закрытие позиции =====
+            // Закрытие позиции по условиям
             if (position != 0)
             {
                 bool shouldClose = false;
                 decimal exitPrice = 0;
                 string exitReason = "";
 
-                // Лонг
-                if (position > 0)
+                // Проверка времени удержания позиции (макс 24 часа)
+                var holdTime = currentKline.OpenTime - tradeHistory.Last().Timestamp;
+                if (holdTime.TotalHours >= 24)
                 {
-                    // Активация трейлинга
-                    if (!trailingActive && currentPrice >= entryPrice + safeAtr * 2)
-                    {
-                        trailingActive = true;
-                        highestPriceSinceEntry = currentPrice;
-                    }
-
-                    // Обновление пика цены
-                    if (trailingActive && currentPrice > highestPriceSinceEntry)
-                        highestPriceSinceEntry = currentPrice;
-
-                    // Проверка выхода по трейлингу
-                    if (trailingActive && currentPrice <= highestPriceSinceEntry - safeAtr * 0.5m)
-                    {
-                        exitPrice = currentPrice;
-                        exitReason = "Trailing Stop";
-                        shouldClose = true;
-                    }
-                    else if (currentPrice <= entryPrice - safeAtr * config.AtrMultiplierSL)
+                    exitPrice = (decimal)currentPrice;
+                    exitReason = "Time Exit";
+                    shouldClose = true;
+                }
+                else if (position > 0) // Длинная позиция
+                {
+                    if ((decimal)currentPrice <= entryPrice - safeAtr * config.AtrMultiplierSL)
                     {
                         exitPrice = entryPrice - safeAtr * config.AtrMultiplierSL;
                         exitReason = "SL";
                         shouldClose = true;
                     }
-                    else if (currentPrice >= entryPrice + safeAtr * config.AtrMultiplierTP)
+                    else if ((decimal)currentPrice >= entryPrice + safeAtr * config.AtrMultiplierTP)
                     {
                         exitPrice = entryPrice + safeAtr * config.AtrMultiplierTP;
                         exitReason = "TP";
                         shouldClose = true;
                     }
-                }
-                // Шорт
-                else
-                {
-                    if (!trailingActive && currentPrice <= entryPrice - safeAtr * 2)
+                    // Трейлинг-стоп
+                    else if ((decimal)currentPrice >= entryPrice + safeAtr * 2 &&
+                            (decimal)currentPrice <= entryPrice + safeAtr * 2 - safeAtr * 0.5m)
                     {
-                        trailingActive = true;
-                        lowestPriceSinceEntry = currentPrice;
-                    }
-
-                    if (trailingActive && currentPrice < lowestPriceSinceEntry)
-                        lowestPriceSinceEntry = currentPrice;
-
-                    if (trailingActive && currentPrice >= lowestPriceSinceEntry + safeAtr * 0.5m)
-                    {
-                        exitPrice = currentPrice;
+                        exitPrice = (decimal)currentPrice;
                         exitReason = "Trailing Stop";
                         shouldClose = true;
                     }
-                    else if (currentPrice >= entryPrice + safeAtr * config.AtrMultiplierSL)
+                }
+                else // Короткая позиция
+                {
+                    if ((decimal)currentPrice >= entryPrice + safeAtr * config.AtrMultiplierSL)
                     {
                         exitPrice = entryPrice + safeAtr * config.AtrMultiplierSL;
                         exitReason = "SL";
                         shouldClose = true;
                     }
-                    else if (currentPrice <= entryPrice - safeAtr * config.AtrMultiplierTP)
+                    else if ((decimal)currentPrice <= entryPrice - safeAtr * config.AtrMultiplierTP)
                     {
                         exitPrice = entryPrice - safeAtr * config.AtrMultiplierTP;
                         exitReason = "TP";
+                        shouldClose = true;
+                    }
+                    // Трейлинг-стоп
+                    else if ((decimal)currentPrice <= entryPrice - safeAtr * 2 &&
+                            (decimal)currentPrice >= entryPrice - safeAtr * 2 + safeAtr * 0.5m)
+                    {
+                        exitPrice = (decimal)currentPrice;
+                        exitReason = "Trailing Stop";
                         shouldClose = true;
                     }
                 }
@@ -821,7 +811,8 @@ public class Program
                         ? position * (exitPrice - entryPrice)
                         : position * (entryPrice - exitPrice);
 
-                    decimal commission = Math.Abs(position) * exitPrice * config.CommissionPercent / 100m;
+                    // Учет комиссии
+                    decimal commission = Math.Abs(position) * exitPrice * config.CommissionPercent / 100m * 2;
                     totalCommission += commission;
                     pnl -= commission;
 
@@ -829,6 +820,7 @@ public class Program
                     tradesCount++;
                     if (pnl > 0) profitableTrades++;
 
+                    // Обновление максимальной просадки
                     if (balance > maxBalance) maxBalance = balance;
                     decimal drawdown = (maxBalance - balance) / maxBalance * 100;
                     if (drawdown > maxDrawdown) maxDrawdown = drawdown;
@@ -846,38 +838,63 @@ public class Program
                         $"Закрытие по {exitReason}. ATR: {safeAtr:F2}"));
 
                     position = 0;
-                    trailingActive = false;
                     equityCurve.Add(balance);
                     continue;
                 }
             }
 
-            // ===== Открытие позиции =====
+            // Улучшенные условия для входа с учетом тренда старшего ТФ
             bool isHigherTrendBullish = higherFastMa > higherSlowMa;
             bool isHigherTrendBearish = higherFastMa < higherSlowMa;
 
             bool isPrimaryBullish = fastMa > slowMa &&
-                                    (double)currentPrice > fastMa &&
-                                    rsi < parameters.OverboughtLevel &&
-                                    (double)currentPrice > lowerBand;
+                                  currentPrice > fastMa &&
+                                  rsi < parameters.OverboughtLevel &&
+                                  currentPrice > lowerBand;
 
             bool isPrimaryBearish = fastMa < slowMa &&
-                                    (double)currentPrice < fastMa &&
-                                    rsi > parameters.OversoldLevel &&
-                                    (double)currentPrice < upperBand;
+                                  currentPrice < fastMa &&
+                                  rsi > parameters.OversoldLevel &&
+                                  currentPrice < upperBand;
 
+            // Комбинированные условия с учетом тренда
             bool isBullish = (isHigherTrendBullish || !isHigherTrendBearish) && isPrimaryBullish;
             bool isBearish = (isHigherTrendBearish || !isHigherTrendBullish) && isPrimaryBearish;
 
+            // Вход в сделку
             if (isBullish && position <= 0)
             {
+                if (position < 0) // Закрываем короткую позицию
+                {
+                    decimal pnl = position * ((decimal)currentPrice - entryPrice);
+                    decimal commission = Math.Abs(position) * (decimal)currentPrice * config.CommissionPercent / 100m;
+                    totalCommission += commission;
+                    pnl -= commission;
+
+                    balance += pnl;
+                    tradesCount++;
+                    if (pnl > 0) profitableTrades++;
+
+                    tradeHistory.Add(new TradeRecord(
+                        currentKline.OpenTime,
+                        "BUY (Close)",
+                        Math.Abs(position),
+                        entryPrice,
+                        (decimal)currentPrice,
+                        0, 0, pnl,
+                        commission,
+                        "Закрытие короткой позиции перед открытием длинной"));
+                }
+
+                // Расчет размера позиции с учетом риска
                 decimal quantity = (balance * config.RiskPerTrade) / (safeAtr * config.AtrMultiplierSL);
                 quantity = Math.Max(quantity, config.MinOrderSize);
-                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / currentPrice);
+                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / (decimal)currentPrice);
 
                 position = quantity;
-                entryPrice = currentPrice;
+                entryPrice = (decimal)currentPrice;
 
+                // Учет комиссии на вход
                 decimal entryCommission = quantity * entryPrice * config.CommissionPercent / 100m;
                 totalCommission += entryCommission;
                 balance -= entryCommission;
@@ -896,13 +913,37 @@ public class Program
             }
             else if (isBearish && position >= 0)
             {
+                if (position > 0) // Закрываем длинную позицию
+                {
+                    decimal pnl = position * ((decimal)currentPrice - entryPrice);
+                    decimal commission = position * (decimal)currentPrice * config.CommissionPercent / 100m;
+                    totalCommission += commission;
+                    pnl -= commission;
+
+                    balance += pnl;
+                    tradesCount++;
+                    if (pnl > 0) profitableTrades++;
+
+                    tradeHistory.Add(new TradeRecord(
+                        currentKline.OpenTime,
+                        "SELL (Close)",
+                        position,
+                        entryPrice,
+                        (decimal)currentPrice,
+                        0, 0, pnl,
+                        commission,
+                        "Закрытие длинной позиции перед открытием короткой"));
+                }
+
+                // Расчет размера позиции с учетом риска
                 decimal quantity = (balance * config.RiskPerTrade) / (safeAtr * config.AtrMultiplierSL);
                 quantity = Math.Max(quantity, config.MinOrderSize);
-                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / currentPrice);
+                quantity = Math.Min(quantity, balance * config.MaxPositionSizePercent / (decimal)currentPrice);
 
                 position = -quantity;
-                entryPrice = currentPrice;
+                entryPrice = (decimal)currentPrice;
 
+                // Учет комиссии на вход
                 decimal entryCommission = quantity * entryPrice * config.CommissionPercent / 100m;
                 totalCommission += entryCommission;
                 balance -= entryCommission;
@@ -920,9 +961,37 @@ public class Program
                     $"Открытие короткой позиции. ATR: {safeAtr:F2}"));
             }
 
-            equityCurve.Add(balance + position * (currentPrice - entryPrice));
+            equityCurve.Add(balance + position * ((decimal)currentPrice - entryPrice));
         }
 
+        // Закрытие последней позиции
+        if (position != 0)
+        {
+            var lastPrice = (double)klines.Last().ClosePrice;
+            decimal pnl = position > 0
+                ? position * ((decimal)lastPrice - entryPrice)
+                : position * (entryPrice - (decimal)lastPrice);
+
+            decimal commission = Math.Abs(position) * (decimal)lastPrice * config.CommissionPercent / 100m;
+            totalCommission += commission;
+            pnl -= commission;
+
+            balance += pnl;
+            tradesCount++;
+            if (pnl > 0) profitableTrades++;
+
+            tradeHistory.Add(new TradeRecord(
+                klines.Last().OpenTime,
+                position > 0 ? "SELL (Close)" : "BUY (Close)",
+                Math.Abs(position),
+                entryPrice,
+                (decimal)lastPrice,
+                0, 0, pnl,
+                commission,
+                "Принудительное закрытие позиции в конце теста"));
+        }
+
+        // Расчет метрик
         double profitRatio = (double)(balance / config.InitialBalance);
         double sharpeRatio = CalculateSharpeRatio(equityCurve);
         double winRate = tradesCount > 0 ? (double)profitableTrades / tradesCount : 0;
