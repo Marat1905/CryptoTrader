@@ -2942,3 +2942,22 @@ public class Program
     }
 }
 
+public static class KlineIntervalExtensions
+{
+    public static TimeSpan ToTimeSpan(this KlineInterval interval)
+    {
+        return interval switch
+        {
+            KlineInterval.OneMinute => TimeSpan.FromMinutes(1),
+            KlineInterval.ThreeMinutes => TimeSpan.FromMinutes(3),
+            KlineInterval.FiveMinutes => TimeSpan.FromMinutes(5),
+            KlineInterval.FifteenMinutes => TimeSpan.FromMinutes(15),
+            KlineInterval.ThirtyMinutes => TimeSpan.FromMinutes(30),
+            KlineInterval.OneHour => TimeSpan.FromHours(1),
+            KlineInterval.TwoHour => TimeSpan.FromHours(2),
+            KlineInterval.FourHour => TimeSpan.FromHours(4),
+            KlineInterval.OneDay => TimeSpan.FromDays(1),
+            _ => TimeSpan.FromHours(1)
+        };
+    }
+}
