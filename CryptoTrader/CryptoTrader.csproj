@@ -16,8 +16,11 @@
     <PackageReference Include="Microsoft.ML" Version="4.0.2" />
     <PackageReference Include="Microsoft.ML.LightGbm" Version="4.0.2" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="NLog" Version="6.0.3" />
+    <PackageReference Include="NLog.Extensions.Logging" Version="6.0.3" />
     <PackageReference Include="Polly" Version="8.6.2" />
     <PackageReference Include="Serilog.Extensions.Logging.File" Version="3.0.0" />
+    <PackageReference Include="Skender.Stock.Indicators" Version="2.6.1" />
     <PackageReference Include="Talib" Version="0.1.0" />
     <PackageReference Include="Telegram.Bot" Version="22.6.0" />
   </ItemGroup>
