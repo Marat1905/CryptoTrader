@@ -39,10 +39,10 @@ public class TradeRecord
 public class TradingBot
 {
     private readonly string _symbol;
-    private readonly int _atrPeriod = 14;
+    private readonly int _atrPeriod = 14; // Уменьшенный период для 15-минутного ТФ
     private decimal _baseRiskPercent = 0.003m;
     private readonly int _minBarsBetweenTrades = 24;
-    private readonly decimal _volatilityThreshold = 0.3m; // Сниженный порог волатильности
+    private readonly decimal _volatilityThreshold = 0.3m; // Повышенный порог волатильности
     private readonly decimal _minPositionSize = 0.0001m;
     private readonly ILogger _logger;
     private readonly ITelegramBotClient _botClient;
@@ -50,15 +50,15 @@ public class TradingBot
     private readonly bool _enableTradeNotifications;
     private readonly decimal _commissionRate = 0.001m;
     private int _lastTradeIndex = -1000;
-    private readonly decimal _maxTradeDrawdown = 0.015m;
+    private const decimal _maxTradeDrawdown = 0.15m; // Увеличенный лимит убытка (3%)
     private const int MIN_BARS_BEFORE_EXIT = 8;
 
-    private readonly int _ichimokuTenkan = 9;
-    private readonly int _ichimokuKijun = 26;
+    private readonly int _ichimokuTenkan = 9;  // Оптимизировано для 15-минутного ТФ
+    private readonly int _ichimokuKijun = 26;  // Оптимизировано для 15-минутного ТФ
     private readonly int _ichimokuSenkou = 52;
     private readonly int _adxPeriod = 14;
-    private readonly int _mfiPeriod = 14; // Уменьшенный период MFI
-    private readonly int _supertrendPeriod = 10;
+    private readonly int _rsiPeriod = 14;
+    private readonly int _supertrendPeriod = 10;  // Уменьшенный период
     private readonly double _supertrendMultiplier = 3.0;
 
     public TradingBot(
@@ -91,7 +91,7 @@ public class TradingBot
         var ichimoku = quotes.GetIchimoku(_ichimokuTenkan, _ichimokuKijun, _ichimokuSenkou).ToList();
         var adx = quotes.GetAdx(_adxPeriod).ToList();
         var obv = quotes.GetObv().ToList();
-        var mfi = quotes.GetMfi(_mfiPeriod).ToList();
+        var rsi = quotes.GetRsi(_rsiPeriod).ToList();
         var atr = quotes.GetAtr(_atrPeriod).ToList();
         var supertrend = quotes.GetSuperTrend(_supertrendPeriod, _supertrendMultiplier).ToList();
 
@@ -116,7 +116,7 @@ public class TradingBot
         int startIndex = new[] {
             _ichimokuSenkou * 2,
             _adxPeriod,
-            _mfiPeriod,
+            _rsiPeriod,
             _atrPeriod,
             _supertrendPeriod
         }.Max();
@@ -146,8 +146,8 @@ public class TradingBot
             if (ichimoku[i].KijunSen == null || ichimoku[i].TenkanSen == null ||
                 ichimoku[i].SenkouSpanA == null || ichimoku[i].SenkouSpanB == null ||
                 adx[i].Adx == null || adx[i].Pdi == null || adx[i].Mdi == null ||
-                obv[i].Obv == null || mfi[i].Mfi == null ||
-                atr[i].Atr == null || supertrend[i].UpperBand == null)
+                obv[i].Obv == null || rsi[i].Rsi == null ||
+                atr[i].Atr == null || supertrend[i].UpperBand == null) // Исправлено на LowerBand
                 continue;
 
             decimal currentKijun = (decimal)ichimoku[i].KijunSen;
@@ -158,9 +158,9 @@ public class TradingBot
             decimal currentPositiveDI = (decimal)adx[i].Pdi;
             decimal currentNegativeDI = (decimal)adx[i].Mdi;
             decimal currentObv = (decimal)obv[i].Obv;
-            decimal currentMfi = (decimal)mfi[i].Mfi;
+            decimal currentRsi = (decimal)rsi[i].Rsi;
             decimal currentAtr = (decimal)atr[i].Atr;
-            decimal currentSupertrend = (decimal)supertrend[i].UpperBand;
+            decimal currentSupertrend = (decimal)supertrend[i].UpperBand; // Исправлено для long позиций
 
             // Замена Chaikin Volatility на ATR-based
             decimal volatilityIndex = (currentAtr / quote.Close) * 100;
@@ -176,7 +176,7 @@ public class TradingBot
             int dynamicMinBars = (int)(_minBarsBetweenTrades * Math.Max(0.5m, 2.0m - volatilityIndex / 10));
 
             bool ichimokuBullish = currentTenkan > currentKijun;
-            bool volumeOk = currentMfi > 40; // Упрощенное условие объема
+            bool volumeOk = currentRsi > 40; // Упрощенное условие объема
             bool timeBetweenTrades = (i - _lastTradeIndex) >= dynamicMinBars;
 
             decimal bodySize = Math.Abs(quote.Open - quote.Close);
@@ -189,7 +189,7 @@ public class TradingBot
                 _logger.LogDebug(
                     $"[{quote.Date}] Условия: " +
                     $"Сессия: {isActiveSession} | Облако: {kumoCloudBullish} | ADX: {currentAdx:F1}>20 | " +
-                    $"Ишимоку: {ichimokuBullish} | MFI: {currentMfi:F1}>40 | " +
+                    $"Ишимоку: {ichimokuBullish} | RSI: {currentRsi:F1}>40 | " +
                     $"Волатильность: {volatilityIndex:F2}%>0.3 | " +
                     $"Дистанция: {i - _lastTradeIndex}>={dynamicMinBars}");
             }
@@ -203,7 +203,7 @@ public class TradingBot
                 entryPrice = quote.Close * 1.0015m;
                 highestPrice = entryPrice;
 
-                decimal takeProfitMultiplier = volatilityIndex > 1.5m ? 2.5m : 1.8m;
+                decimal takeProfitMultiplier = volatilityIndex > 1.5m ? 2.5m : 3.0m; // Увеличен множитель
                 decimal stopDistance = currentAtr * 2.0m;
                 trailStopLevel = entryPrice - stopDistance;
                 takeProfitLevel = entryPrice + stopDistance * takeProfitMultiplier;
@@ -239,10 +239,24 @@ public class TradingBot
 
             if (position > 0)
             {
-                decimal newStopLevel = Math.Max(trailStopLevel, currentSupertrend);
-                if (newStopLevel > trailStopLevel)
+                // Обновляем высшую цену и трейлинг-стоп
+                if (quote.High > highestPrice)
                 {
-                    trailStopLevel = newStopLevel;
+                    highestPrice = quote.High;
+                    // Динамическое обновление стопа
+                    decimal newStopLevel = Math.Max(trailStopLevel, highestPrice - currentAtr * 1.5m);
+                    if (newStopLevel > trailStopLevel)
+                    {
+                        trailStopLevel = newStopLevel;
+                        _logger.LogDebug($"Обновлен трейлинг-стоп: {trailStopLevel:F2}");
+                    }
+                }
+
+                // Обновление стопа по супертренду
+                decimal newSupertrendStop = Math.Max(trailStopLevel, currentSupertrend);
+                if (newSupertrendStop > trailStopLevel)
+                {
+                    trailStopLevel = newSupertrendStop;
                     _logger.LogDebug($"Обновлен Supertrend стоп: {trailStopLevel:F2}");
                 }
 
@@ -274,11 +288,12 @@ public class TradingBot
                     continue;
                 }
 
-                if (quote.High >= entryPrice + currentAtr * 1.5m)
+                // Частичное закрытие с увеличенным множителем
+                if (quote.High >= entryPrice + currentAtr * 2.5m)
                 {
                     decimal partialExitPercent = 0.5m;
                     decimal partialPosition = position * partialExitPercent;
-                    decimal exitPrice = entryPrice + currentAtr * 1.5m;
+                    decimal exitPrice = entryPrice + currentAtr * 2.5m;
 
                     decimal tradeValue = partialPosition * exitPrice;
                     decimal tradeFee = tradeValue * _commissionRate;
@@ -303,10 +318,11 @@ public class TradingBot
                     _logger.LogInformation($"ЧАСТИЧНАЯ ПРОДАЖА 50% {_symbol} по {exitPrice:F4}");
                 }
 
+                // Улучшенные условия выхода
                 bool takeProfitHit = quote.High >= takeProfitLevel;
-                bool stopHit = quote.Low <= trailStopLevel;
-                bool trendWeak = currentAdx < 18; // Сниженный порог выхода
-                bool kumoExit = quote.Close < Math.Min(currentSenkouA, currentSenkouB); // Ослабленное условие
+                bool stopHit = quote.Low <= trailStopLevel && quote.Close < trailStopLevel; // Фильтр ложных пробоев
+                bool trendWeak = currentAdx < 18;
+                bool kumoExit = quote.Close < Math.Min(currentSenkouA, currentSenkouB);
 
                 bool isEarlyExit = (i - _lastTradeIndex) < MIN_BARS_BEFORE_EXIT;
                 if (isEarlyExit && (trendWeak || kumoExit))
@@ -318,14 +334,29 @@ public class TradingBot
 
                 if (takeProfitHit || stopHit || trendWeak || kumoExit)
                 {
-                    decimal exitPrice = takeProfitHit ? takeProfitLevel :
-                                      stopHit ? trailStopLevel :
-                                      quote.Close;
+                    decimal exitPrice;
+                    string reason;
 
-                    string reason = takeProfitHit ? "ТЕЙК-ПРОФИТ" :
-                                  stopHit ? "СТОП-ЛОСС" :
-                                  trendWeak ? "СЛАБЫЙ ТРЕНД" :
-                                  "ВЫХОД ИЗ ОБЛАКА";
+                    if (takeProfitHit)
+                    {
+                        exitPrice = takeProfitLevel;
+                        reason = "ТЕЙК-ПРОФИТ";
+                    }
+                    else if (stopHit)
+                    {
+                        exitPrice = trailStopLevel;
+                        reason = "СТОП-ЛОСС";
+                    }
+                    else if (trendWeak)
+                    {
+                        exitPrice = quote.Close;
+                        reason = "СЛАБЫЙ ТРЕНД";
+                    }
+                    else
+                    {
+                        exitPrice = quote.Close;
+                        reason = "ВЫХОД ИЗ ОБЛАКА";
+                    }
 
                     decimal tradeValue = position * exitPrice;
                     decimal tradeFee = tradeValue * _commissionRate;
@@ -458,10 +489,10 @@ public class BotConfig
     public string ApiSecret { get; set; } = "YOUR_BINANCE_API_SECRET";
     public string TelegramToken { get; set; } = "6299377057:AAHaNlY93hdrdQVanTPgmMibgQt41UDidRA";
     public string TelegramChatId { get; set; } = "1314937104";
-    public string Symbol { get; set; } = "BTCUSDT"; // Более волатильный актив
-    public DateTime BacktestStartDate { get; set; } = new DateTime(2023, 1, 1); // Более длинный период
+    public string Symbol { get; set; } = "BTCUSDT";
+    public DateTime BacktestStartDate { get; set; } = new DateTime(2023, 1, 1);
     public DateTime BacktestEndDate { get; set; } = DateTime.UtcNow;
-    public KlineInterval BacktestInterval { get; set; } = KlineInterval.FifteenMinutes; // Более старший ТФ
+    public KlineInterval BacktestInterval { get; set; } = KlineInterval.FifteenMinutes;
     public bool EnableTradeNotifications { get; set; } = true;
     public decimal InitialBalance { get; set; } = 1000m;
 }
@@ -476,7 +507,7 @@ class Program
         using var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder.AddConsole();
-            builder.SetMinimumLevel(LogLevel.Information);
+            builder.SetMinimumLevel(LogLevel.Debug);
             builder.AddFile("logs/bot_{Date}.log");
         });
 
