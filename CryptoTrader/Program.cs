@@ -41,8 +41,8 @@ public class TradingBot
     private readonly string _symbol;
     private readonly int _atrPeriod = 14; // Уменьшенный период для 15-минутного ТФ
     private decimal _baseRiskPercent = 0.003m;
-    private readonly int _minBarsBetweenTrades = 24;
-    private readonly decimal _volatilityThreshold = 0.3m; // Повышенный порог волатильности
+    private readonly int _minBarsBetweenTrades = 12;
+    private readonly decimal _volatilityThreshold = 0.2m; // Повышенный порог волатильности
     private readonly decimal _minPositionSize = 0.0001m;
     private readonly ILogger _logger;
     private readonly ITelegramBotClient _botClient;
@@ -50,7 +50,6 @@ public class TradingBot
     private readonly bool _enableTradeNotifications;
     private readonly decimal _commissionRate = 0.001m;
     private int _lastTradeIndex = -1000;
-    private const decimal _maxTradeDrawdown = 0.15m; // Увеличенный лимит убытка (3%)
     private const int MIN_BARS_BEFORE_EXIT = 8;
 
     private readonly int _ichimokuTenkan = 9;  // Оптимизировано для 15-минутного ТФ
@@ -112,6 +111,8 @@ public class TradingBot
         bool tradingHalted = false;
         var trades = new List<TradeRecord>();
         var dailyReturns = new List<decimal>();
+        decimal entryAtr = 0;
+        decimal currentTradeAtrMultiplier = 3.5m;
 
         int startIndex = new[] {
             _ichimokuSenkou * 2,
@@ -170,18 +171,18 @@ public class TradingBot
 
             // Ослабленное условие облака Ишимоку
             bool kumoCloudBullish = quote.Close > Math.Min(currentSenkouA, currentSenkouB);
-            bool strongTrend = currentAdx > 20; // Сниженный порог ADX
+            bool strongTrend = currentAdx > 15; // Сниженный порог ADX
 
             decimal dynamicRiskPercent = volatilityIndex > 1.5m ? _baseRiskPercent * 0.7m : _baseRiskPercent;
             int dynamicMinBars = (int)(_minBarsBetweenTrades * Math.Max(0.5m, 2.0m - volatilityIndex / 10));
 
             bool ichimokuBullish = currentTenkan > currentKijun;
-            bool volumeOk = currentRsi > 40; // Упрощенное условие объема
+            bool volumeOk = currentRsi > 35; // Упрощенное условие объема
             bool timeBetweenTrades = (i - _lastTradeIndex) >= dynamicMinBars;
 
             decimal bodySize = Math.Abs(quote.Open - quote.Close);
             decimal totalRange = quote.High - quote.Low;
-            bool isGoodCandle = bodySize > totalRange * 0.3m;
+            bool isGoodCandle = bodySize > totalRange * 0.2m;
 
             // Расширенное логирование условий
             if (i % 50 == 0)
@@ -226,6 +227,10 @@ public class TradingBot
                     continue;
                 }
 
+                // Сохраняем ATR и множитель для текущей сделки
+                entryAtr = currentAtr;
+                currentTradeAtrMultiplier = volatilityIndex > 1.5m ? 3.0m : 3.5m;
+
                 decimal tradeValue = position * entryPrice;
                 decimal tradeFee = tradeValue * _commissionRate;
                 capital -= tradeValue + tradeFee;
@@ -234,11 +239,40 @@ public class TradingBot
                 tradeCount++;
                 _lastTradeIndex = i;
 
-                _logger.LogInformation($"ПОКУПКА {_symbol} по {entryPrice:F4} | Размер: {position:F6} | Риск: {tradeRiskPercent * 100:F2}%");
+                _logger.LogInformation($"ПОКУПКА {_symbol} по {entryPrice:F4} | Размер: {position:F6} | Риск: {tradeRiskPercent * 100:F2}% | ATR: {currentAtr:F4}");
             }
 
             if (position > 0)
             {
+                // Защита по максимальному падению на основе ATR
+                decimal maxAllowedDrop = entryPrice - (currentTradeAtrMultiplier * entryAtr);
+                if (quote.Low <= maxAllowedDrop)
+                {
+                    decimal exitPrice = Math.Max(quote.Open, maxAllowedDrop);
+                    decimal tradeValue = position * exitPrice;
+                    decimal tradeFee = tradeValue * _commissionRate;
+                    capital += tradeValue - tradeFee;
+                    totalFees += tradeFee;
+
+                    _logger.LogWarning($"ЭКСТРЕННАЯ ПРОДАЖА {_symbol} по {exitPrice:F4} | Причина: резкое падение (ATR защита)");
+
+                    trades.Add(new TradeRecord
+                    {
+                        EntryDate = quotes[_lastTradeIndex].Date,
+                        EntryPrice = entryPrice,
+                        ExitDate = quote.Date,
+                        ExitPrice = exitPrice,
+                        Profit = tradeValue - (position * entryPrice) - tradeFee,
+                        IsWin = false,
+                        VolatilityIndex = volatilityIndex,
+                        ExitReason = "ATR_DRAWDOWN",
+                        PositionSize = position
+                    });
+
+                    position = 0;
+                    continue;
+                }
+
                 // Обновляем высшую цену и трейлинг-стоп
                 if (quote.High > highestPrice)
                 {
@@ -258,34 +292,6 @@ public class TradingBot
                 {
                     trailStopLevel = newSupertrendStop;
                     _logger.LogDebug($"Обновлен Supertrend стоп: {trailStopLevel:F2}");
-                }
-
-                decimal unrealizedLoss = 1 - (quote.Close / entryPrice);
-                if (unrealizedLoss > _maxTradeDrawdown)
-                {
-                    decimal exitPrice = entryPrice * (1 - _maxTradeDrawdown);
-                    decimal tradeValue = position * exitPrice;
-                    decimal tradeFee = tradeValue * _commissionRate;
-                    capital += tradeValue - tradeFee;
-                    totalFees += tradeFee;
-
-                    _logger.LogWarning($"ЭКСТРЕННАЯ ПРОДАЖА {_symbol} по {exitPrice:F4} | Причина: превышение лимита убытка");
-
-                    trades.Add(new TradeRecord
-                    {
-                        EntryDate = quotes[_lastTradeIndex].Date,
-                        EntryPrice = entryPrice,
-                        ExitDate = quote.Date,
-                        ExitPrice = exitPrice,
-                        Profit = tradeValue - (position * entryPrice) - tradeFee,
-                        IsWin = false,
-                        VolatilityIndex = volatilityIndex,
-                        ExitReason = "MAX_DRAWDOWN",
-                        PositionSize = position
-                    });
-
-                    position = 0;
-                    continue;
                 }
 
                 // Частичное закрытие с увеличенным множителем
@@ -507,7 +513,7 @@ class Program
         using var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder.AddConsole();
-            builder.SetMinimumLevel(LogLevel.Debug);
+            builder.SetMinimumLevel(LogLevel.Information);
             builder.AddFile("logs/bot_{Date}.log");
         });
 
